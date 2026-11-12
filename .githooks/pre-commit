@@ -1,0 +1,66 @@
+#!/bin/bash
+# Install this hook via
+#   cp .githooks/pre-commit .git/hooks && chmod +x .git/hooks/pre-commit
+
+# Regex patterns for sensitive tokens
+# Matches GitHub PATs (classic & fine-grained), OAuth, User-to-Server, Server-to-Server, and Refresh tokens
+GITHUB_TOKEN_REGEX="(gh[pousr]_[A-Za-z0-9_]{36}|github_pat_[A-Za-z0-9_]{22}_[A-Za-z0-9_]{59})"
+
+# Matches Buildkite User Access Tokens
+BUILDKITE_TOKEN_REGEX="bkua_[A-Za-z0-9_]{32,}"
+
+# Combine into a single regex for searching
+COMBINED_REGEX="($GITHUB_TOKEN_REGEX|$BUILDKITE_TOKEN_REGEX)"
+
+SECRETS_FOUND=0
+OVERSIZED_FOUND=0
+MAX_BYTES="${MAX_FILE_SIZE_BYTES:-$((25 * 1024 * 1024))}"
+
+# Inspect each staged file (Added, Copied, or Modified), NUL-delimited so paths
+# with spaces are handled safely. Deleted files are ignored.
+while IFS= read -r -d '' file; do
+    # 1. git diff --cached: Outputs the diff of the staged changes
+    # 2. grep '^+': Only look at newly added lines
+    # 3. grep -v '^+++': Ignore the diff file headers
+    # 4. grep -q -E: Check quietly against the regex
+    if git diff --cached -- "$file" | grep '^+' | grep -v '^+++' | grep -E -q "$COMBINED_REGEX"; then
+        echo "  ❌ $file (contains token pattern)" >&2
+        SECRETS_FOUND=1
+    fi
+
+    if [ "$(git cat-file -t ":$file" 2>/dev/null)" = "blob" ]; then
+        blob_size=$(git cat-file -s ":$file")
+        if [ "$blob_size" -gt "$MAX_BYTES" ]; then
+            echo "  ❌ $file ($blob_size bytes > $MAX_BYTES bytes)" >&2
+            OVERSIZED_FOUND=1
+        fi
+    fi
+done < <(git diff --cached --name-only -z --diff-filter=ACM)
+
+if [ $SECRETS_FOUND -eq 1 ]; then
+    echo "" >&2
+    echo "========================================================================" >&2
+    echo "🚨 ERROR: Commit rejected! Sensitive token(s) detected in the files above." >&2
+    echo "" >&2
+    echo "A GitHub or Buildkite token was found in your staged changes." >&2
+    echo "Please remove the token from your code, stage the changes (git add), and commit again." >&2
+    echo "" >&2
+    echo "If this is a false positive, you can bypass this hook using:" >&2
+    echo "  git commit --no-verify" >&2
+    echo "========================================================================" >&2
+    exit 1
+fi
+
+if [ $OVERSIZED_FOUND -eq 1 ]; then
+    echo "" >&2
+    echo "========================================================================" >&2
+    echo "🚨 ERROR: Commit rejected! File(s) above exceed the $MAX_BYTES-byte limit" >&2
+    echo "due to limitations of an internal clone of this repository." >&2
+    echo "" >&2
+    echo "Store large binaries or archives externally (for example, in GCS)" >&2
+    echo "instead of committing them to Git." >&2
+    echo "========================================================================" >&2
+    exit 1
+fi
+
+exit 0

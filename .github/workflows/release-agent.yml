@@ -59,22 +59,38 @@ jobs:
       RUST_BACKTRACE: 1
     strategy:
       matrix:
-        build: [linux, macos, win-msvc]
+        build: [linux, linux-aarch64, macos-intel, macos-m1, win-msvc]
         include:
         - build: linux
-          os: ubuntu-18.04
+          os: ubuntu-latest
           rust: nightly
           target: x86_64-unknown-linux-musl
-        - build: macos
+        - build: linux-aarch64
+          os: ubuntu-latest
+          rust: nightly
+          target: aarch64-unknown-linux-musl # cross compile to aarch64 on x86_64
+        - build: macos-intel
           os: macos-latest
           rust: nightly
           target: x86_64-apple-darwin
+        - build: macos-m1
+          os: macos-latest
+          rust: nightly
+          target: aarch64-apple-darwin # cross compile to aarch64 on x86_64
         - build: win-msvc
           os: windows-latest
           rust: nightly
           target: x86_64-pc-windows-msvc
 
     steps:
+    - name: Install deps (linux-aarch64)
+      if: matrix.build == 'linux-aarch64'
+      run: sudo apt-get install -y wget && cd /opt && wget http://musl.cc/aarch64-linux-musl-cross.tgz && tar xf aarch64-linux-musl-cross.tgz
+
+    - name: Install deps (linux)
+      if: matrix.build == 'linux'
+      run: sudo apt-get install -y musl-tools
+
     - name: Checkout repository
       uses: actions/checkout@v2
       with:
@@ -89,17 +105,29 @@ jobs:
         target: ${{ matrix.target }}
 
     - name: Test release binary
+      if: matrix.build != 'macos-m1' && matrix.build != 'linux-aarch64' # Can't run aarch64 binary on x86_64
       working-directory: agent
       run: cargo test --verbose --release --target ${{ matrix.target }}
 
     - name: Build release binary
+      if: matrix.build != 'linux-aarch64'
       working-directory: agent
       run: cargo build --verbose --release --target ${{ matrix.target }}
 
+    - name: Build release binary (linux-aarch64)
+      if: matrix.build == 'linux-aarch64'
+      working-directory: agent
+      run: CC=/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc cargo build --verbose --release --target ${{ matrix.target }} --config target.${{ matrix.target }}.linker=\"/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-ld\"
+
     - name: Strip release binary (linux and macos)
-      if: matrix.build == 'linux' || matrix.build == 'macos'
+      if: matrix.build == 'linux' || matrix.build == 'macos-intel' || matrix.build == 'macos-m1'
       working-directory: agent
       run: strip "target/${{ matrix.target }}/release/bazelci-agent"
+
+    - name: Strip release binary (linux-aarch64)
+      if: matrix.build == 'linux-aarch64'
+      working-directory: agent
+      run: /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-strip "target/${{ matrix.target }}/release/bazelci-agent"
 
     - name: Build release asset
       shell: bash

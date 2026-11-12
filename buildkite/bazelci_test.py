@@ -1,0 +1,1508 @@
+#!/usr/bin/env python3
+#
+# Copyright 2023 The Bazel Authors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+
+os.environ["BUILDKITE_ORGANIZATION_SLUG"] = "bazel"
+os.environ["BUILDKITE_PIPELINE_SLUG"] = "test"
+
+import bazelci
+import json
+import shlex
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+import yaml
+
+
+class CalculateFlags(unittest.TestCase):
+    _CONFIGS = yaml.safe_load(
+        """
+.base_flags: &base_flags
+  ? "--enable_a"
+  ? "--enable_b"
+
+tasks:
+  basic:
+    build_flags:
+      - "--enable_x"
+      - "--enable_y"
+    build_targets:
+      - "//..."
+  json_profile:
+    build_flags:
+      - "--enable_x"
+      - "--enable_y"
+    build_targets:
+      - "//..."
+    include_json_profile:
+      - build
+  capture_corrupted:
+    build_flags:
+      - "--enable_x"
+      - "--enable_y"
+    build_targets:
+      - "//..."
+    capture_corrupted_outputs:
+      - build
+  no_flags:
+    test_targets:
+      - "//..."
+  merge_flags:
+    build_flags:
+      <<: *base_flags
+      ? "--enable_z"
+      ? "--enable_w"
+    build_targets:
+      - "//..."
+  flatten_flags:
+    build_flags:
+      - "--enable_z"
+      - ["--enable_y", "--enable_x"]
+      - "--enable_w"
+    """
+    )
+
+    def test_basic_functionality(self):
+        tasks = self._CONFIGS.get("tasks")
+        flags, json_profile_out, capture_corrupted_outputs_dir = bazelci.calculate_flags(
+            tasks.get("basic"), "build_flags", "build", "/tmp", ["HOME"]
+        )
+        self.assertEqual(flags, ["--enable_x", "--enable_y", "--test_env=HOME"])
+        self.assertEqual(json_profile_out, None)
+        self.assertEqual(capture_corrupted_outputs_dir, None)
+
+    def test_json_profile(self):
+        tasks = self._CONFIGS.get("tasks")
+        flags, json_profile_out, capture_corrupted_outputs_dir = bazelci.calculate_flags(
+            tasks.get("json_profile"), "build_flags", "build", "/tmp", ["HOME"]
+        )
+        expected_profile = os.path.join("/tmp", "build.profile.gz")
+        self.assertEqual(
+            flags,
+            ["--enable_x", "--enable_y", "--profile={}".format(expected_profile), "--test_env=HOME"],
+        )
+        self.assertEqual(json_profile_out, expected_profile)
+
+    def test_capture_corrupted(self):
+        tasks = self._CONFIGS.get("tasks")
+        flags, json_profile_out, capture_corrupted_outputs_dir = bazelci.calculate_flags(
+            tasks.get("capture_corrupted"), "build_flags", "build", "/tmp", ["HOME"]
+        )
+        expected_corrupted_dir = os.path.join("/tmp", "build_corrupted_outputs")
+        self.assertEqual(
+            flags,
+            [
+                "--enable_x",
+                "--enable_y",
+                "--experimental_remote_capture_corrupted_outputs={}".format(expected_corrupted_dir),
+                "--test_env=HOME",
+            ],
+        )
+        self.assertEqual(capture_corrupted_outputs_dir, expected_corrupted_dir)
+
+    def test_no_flags_in_config(self):
+        tasks = self._CONFIGS.get("tasks")
+        flags, json_profile_out, capture_corrupted_outputs_dir = bazelci.calculate_flags(
+            tasks.get("no_flags"), "build_flags", "build", "/tmp", ["HOME"]
+        )
+        self.assertEqual(flags, ["--test_env=HOME"])
+
+    def test_merge_flags(self):
+        tasks = self._CONFIGS.get("tasks")
+        flags, json_profile_out, capture_corrupted_outputs_dir = bazelci.calculate_flags(
+            tasks.get("merge_flags"), "build_flags", "build", "/tmp", ["HOME"]
+        )
+        self.assertEqual(
+            flags,
+            ["--enable_a", "--enable_b", "--enable_z", "--enable_w", "--test_env=HOME"],
+        )
+
+    def test_flatten_flags(self):
+        tasks = self._CONFIGS.get("tasks")
+        flags, json_profile_out, capture_corrupted_outputs_dir = bazelci.calculate_flags(
+            tasks.get("flatten_flags"), "build_flags", "build", "/tmp", ["HOME"]
+        )
+        self.assertEqual(
+            flags,
+            [
+                "--enable_z",
+                "--enable_y",
+                "--enable_x",
+                "--enable_w",
+                "--test_env=HOME"],
+        )
+
+
+class CalculateTargets(unittest.TestCase):
+    _CONFIGS = yaml.safe_load(
+        """
+.base_targets: &base_targets
+  ? "//..."
+  ? "-//experimental/..."
+
+tasks:
+  basic:
+    build_targets:
+      - "//..."
+      - "-//bad/..."
+  merge:
+    build_targets:
+      <<: *base_targets
+      ? "//experimental/good/..."
+
+  flatten:
+    build_targets:
+      - "//..."
+      - ["-//bad/one", "-//bad/two"]
+      - "-//bad/three"
+    """
+    )
+
+    def test_basic_functionality(self):
+        tasks = self._CONFIGS.get("tasks")
+        build_targets, test_targets, coverage_targets, index_targets = bazelci.calculate_targets(
+            tasks.get("basic"),
+            "bazel",
+            build_only=False,
+            test_only=False,
+            workspace_dir="/tmp",
+            ws_setup_func=None,
+            git_commit="abcd",
+            test_flags=[],
+        )
+        self.assertEqual(build_targets, ["//...", "-//bad/..."])
+        self.assertEqual(test_targets, [])
+        self.assertEqual(coverage_targets, [])
+        self.assertEqual(index_targets, [])
+
+    def test_merge(self):
+        tasks = self._CONFIGS.get("tasks")
+        build_targets, test_targets, coverage_targets, index_targets = bazelci.calculate_targets(
+            tasks.get("merge"),
+            "bazel",
+            build_only=False,
+            test_only=False,
+            workspace_dir="/tmp",
+            ws_setup_func=None,
+            git_commit="abcd",
+            test_flags=[],
+        )
+        self.assertEqual(build_targets, ["//...", "-//experimental/...", "//experimental/good/..."])
+
+    def test_flatten(self):
+        tasks = self._CONFIGS.get("tasks")
+        build_targets, test_targets, coverage_targets, index_targets = bazelci.calculate_targets(
+            tasks.get("flatten"),
+            "bazel",
+            build_only=False,
+            test_only=False,
+            workspace_dir="/tmp",
+            ws_setup_func=None,
+            git_commit="abcd",
+            test_flags=[],
+        )
+        self.assertEqual(build_targets, [
+            "//...",
+            "-//bad/one",
+            "-//bad/two",
+            "-//bad/three",
+        ])
+
+    def _calculate_targets_with_bazel_diff(self, shard_id, shard_count, all_targets, **patches):
+        diffbase = "8191888673e840a217aef137d2a9670b94a87fcd"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "USE_BAZEL_DIFF": diffbase,
+                "BUILDKITE_PARALLEL_JOB": str(shard_id),
+                "BUILDKITE_PARALLEL_JOB_COUNT": str(shard_count),
+            },
+        ), mock.patch.object(bazelci, "can_use_bazel_diff", return_value=True), mock.patch.object(
+            bazelci, "expand_test_target_patterns", return_value=all_targets
+        ), mock.patch.object(
+            bazelci, "upload_shard_distribution"
+        ) as mock_upload, mock.patch.object(
+            bazelci, "download_file", return_value="/tmp/bazel-diff.jar"
+        ), mock.patch.object(
+            bazelci, "execute_command"
+        ), mock.patch(
+            "os.chdir"
+        ), mock.patch.multiple(
+            bazelci, **patches
+        ):
+            _, test_targets, _, _ = bazelci.calculate_targets(
+                {"test_targets": ["//..."]},
+                "bazel",
+                build_only=False,
+                test_only=False,
+                workspace_dir="/tmp",
+                ws_setup_func=lambda _: None,
+                git_commit="abcd",
+                test_flags=[],
+            )
+            return test_targets, mock_upload
+
+    def test_sharding_after_bazel_diff(self):
+        all_targets = ["//pkg:t1", "//pkg:t2", "//pkg:t3", "//pkg:t4", "//pkg:t5"]
+        affected_targets = ["//pkg:t2", "//pkg:t3", "//pkg:t5"]
+
+        shard_targets = []
+        for shard_id in range(2):
+            targets, mock_upload = self._calculate_targets_with_bazel_diff(
+                shard_id,
+                2,
+                all_targets,
+                checkout_diffbase=mock.DEFAULT,
+                run_bazel_diff=mock.Mock(return_value=affected_targets),
+            )
+            shard_targets.append(targets)
+            if shard_id == 0:
+                # The shard distribution only contains the targets that bazel-diff kept.
+                mock_upload.assert_called_once_with(affected_targets, 2, test_durations=None)
+
+        # The targets that bazel-diff kept are split across shards, not all targets.
+        self.assertEqual(shard_targets, [["//pkg:t2", "//pkg:t5"], ["//pkg:t3"]])
+
+    def test_bazel_diff_failure_fails_the_job(self):
+        all_targets = ["//pkg:t1", "//pkg:t2", "//pkg:t3", "//pkg:t4"]
+
+        with self.assertRaises(bazelci.BuildkiteException) as ctx:
+            self._calculate_targets_with_bazel_diff(
+                0,
+                2,
+                all_targets,
+                checkout_diffbase=mock.Mock(
+                    side_effect=bazelci.BuildkiteInfraException("simulated failure")
+                ),
+            )
+
+        # The job must fail with the exit code that Buildkite retries automatically,
+        # instead of falling back to all targets (which would drop targets on other shards).
+        self.assertEqual(ctx.exception.exit_code, bazelci.BAZEL_DIFF_FAILURE_EXIT_CODE)
+        self.assertIn("simulated failure", str(ctx.exception))
+
+    def test_checkout_diffbase_skips_fetch_when_commit_present(self):
+        diffbase = "8191888673e840a217aef137d2a9670b94a87fcd"
+        with mock.patch.object(
+            bazelci, "execute_command", return_value=0
+        ) as mock_exec, mock.patch.object(
+            bazelci, "execute_command_and_get_output", return_value="/repo/root\n"
+        ):
+            bazelci.checkout_diffbase(diffbase, "/tmp/dest")
+
+        self.assertEqual(
+            mock_exec.call_args_list,
+            [
+                mock.call(
+                    ["git", "cat-file", "-e", f"{diffbase}^{{commit}}"],
+                    fail_if_nonzero=False,
+                ),
+                mock.call(
+                    ["git", "clone", "--shared", "--no-checkout", "/repo/root", "/tmp/dest"],
+                    capture_stderr=True,
+                ),
+                mock.call(
+                    ["git", "-C", "/tmp/dest", "checkout", "--detach", "--quiet", diffbase],
+                    capture_stderr=True,
+                ),
+            ],
+        )
+
+    def test_checkout_diffbase_fetches_when_commit_missing(self):
+        diffbase = "8191888673e840a217aef137d2a9670b94a87fcd"
+        with mock.patch.object(
+            bazelci, "execute_command", side_effect=[1, 0, 0, 0]
+        ) as mock_exec, mock.patch.object(
+            bazelci, "execute_command_and_get_output", return_value="/repo/root\n"
+        ):
+            bazelci.checkout_diffbase(diffbase, "/tmp/dest")
+
+        self.assertEqual(
+            mock_exec.call_args_list[1],
+            mock.call(["git", "fetch", "origin", diffbase], capture_stderr=True),
+        )
+
+
+class MatrixExpansion(unittest.TestCase):
+    _CONFIGS = yaml.safe_load(
+        """
+matrix:
+  bazel: ["1.2.3", "2.3.4"]
+  platform: ["pf1", "pf2"]
+  exit_status: [1, 2]
+tasks:
+  basic:
+    name: "Basic"
+  unformatted:
+    name: "Unformatted"
+    bazel: ${{ bazel }}
+  without_name:
+    bazel: ${{ bazel }}
+  formatted:
+    name: "Formatted w/ Bazel v{bazel} on {platform}"
+    bazel: ${{ bazel }}
+    platform: ${{ platform }}
+  exit_status:
+    name: "Exit Status: {exit_status}"
+    soft_fail:
+      - exit_status: ${{exit_status}}
+    """
+    )
+
+    def test_basic_functionality(self):
+        import copy
+
+        config = copy.deepcopy(self._CONFIGS)
+
+        bazelci.expand_task_config(config)
+        expanded_tasks = config["tasks"]
+
+        self.assertEqual(
+            list(expanded_tasks.values()),
+            [
+                # no matrix expansion
+                dict(name="Basic"),
+                dict(name="Unformatted", bazel="1.2.3"),
+                dict(name="Unformatted", bazel="2.3.4"),
+                # no name
+                dict(bazel="1.2.3"),
+                dict(bazel="2.3.4"),
+                dict(name="Formatted w/ Bazel v1.2.3 on pf1", bazel="1.2.3", platform="pf1"),
+                dict(name="Formatted w/ Bazel v1.2.3 on pf2", bazel="1.2.3", platform="pf2"),
+                dict(name="Formatted w/ Bazel v2.3.4 on pf1", bazel="2.3.4", platform="pf1"),
+                dict(name="Formatted w/ Bazel v2.3.4 on pf2", bazel="2.3.4", platform="pf2"),
+                dict(name="Exit Status: 1", soft_fail=[dict(exit_status=1)]),
+                dict(name="Exit Status: 2", soft_fail=[dict(exit_status=2)]),
+            ],
+        )
+
+    def test_embedded_matrix_expansion(self):
+        config = yaml.safe_load(
+            """
+matrix:
+  bazel_version:
+    7.x: 7.7.1
+    8.x: 8.6.0
+tasks:
+  embedded:
+    name: "Embedded {bazel_version}"
+    build_flags:
+      - --config=bazel-${{ bazel_version }}
+      - --bazel_version=${{ bazel_version }}
+      - prefix-${{ bazel_version }}-suffix
+            """
+        )
+
+        bazelci.expand_task_config(config)
+        expanded_tasks = list(config["tasks"].values())
+
+        self.assertEqual(
+            expanded_tasks,
+            [
+                dict(
+                    name="Embedded 7.x",
+                    build_flags=[
+                        "--config=bazel-7.7.1",
+                        "--bazel_version=7.7.1",
+                        "prefix-7.7.1-suffix",
+                    ],
+                ),
+                dict(
+                    name="Embedded 8.x",
+                    build_flags=[
+                        "--config=bazel-8.6.0",
+                        "--bazel_version=8.6.0",
+                        "prefix-8.6.0-suffix",
+                    ],
+                ),
+            ],
+        )
+
+
+class MatrixExclude(unittest.TestCase):
+    _CONFIGS_SINGLE_EXCLUDE = yaml.safe_load(
+        """
+matrix:
+  bazel: ["1.2.3", "2.3.4"]
+  platform: ["pf1", "pf2"]
+  exclude:
+    - bazel: "1.2.3"
+      platform: "pf2"
+tasks:
+  formatted:
+    name: "Formatted w/ Bazel v{bazel} on {platform}"
+    bazel: ${{ bazel }}
+    platform: ${{ platform }}
+        """
+    )
+
+    _CONFIGS_MULTIPLE_EXCLUDES = yaml.safe_load(
+        """
+matrix:
+  bazel: ["1.2.3", "2.3.4"]
+  platform: ["pf1", "pf2"]
+  exclude:
+    - bazel: "1.2.3"
+      platform: "pf2"
+    - bazel: "2.3.4"
+      platform: "pf1"
+tasks:
+  formatted:
+    name: "Formatted w/ Bazel v{bazel} on {platform}"
+    bazel: ${{ bazel }}
+    platform: ${{ platform }}
+        """
+    )
+
+    _CONFIGS_PARTIAL_EXCLUDE = yaml.safe_load(
+        """
+matrix:
+  bazel: ["1.2.3", "2.3.4"]
+  platform: ["pf1", "pf2"]
+  exclude:
+    - platform: "pf2"
+tasks:
+  formatted:
+    name: "Formatted w/ Bazel v{bazel} on {platform}"
+    bazel: ${{ bazel }}
+    platform: ${{ platform }}
+        """
+    )
+
+    _CONFIGS_DICT_EXCLUDE = yaml.safe_load(
+        """
+matrix:
+  flags:
+    set-one: ["--one", "--two"]
+    set-two: ["--three", "--four"]
+  platform: ["pf1", "pf2"]
+  exclude:
+    - platform: "pf2"
+      flags: set-one
+tasks:
+  formatted:
+    name: "Formatted on {platform} with flags {flags}"
+    platform: ${{ platform }}
+    build_flags: ${{ flags }}
+        """
+    )
+
+    def test_single_exclude(self):
+        import copy
+        config = copy.deepcopy(self._CONFIGS_SINGLE_EXCLUDE)
+
+        bazelci.expand_task_config(config)
+        expanded_tasks = config["tasks"]
+        # Total combinations: 2 * 2 = 4, minus 1 excluded = 3
+        self.assertEqual(len(expanded_tasks), 3)
+        expanded_task_names = [task.get("name", None) for id, task in expanded_tasks.items()]
+        self.assertEqual(expanded_task_names, [
+            "Formatted w/ Bazel v1.2.3 on pf1",
+            "Formatted w/ Bazel v2.3.4 on pf1",
+            "Formatted w/ Bazel v2.3.4 on pf2",
+        ])
+
+    def test_multiple_excludes(self):
+        import copy
+        config = copy.deepcopy(self._CONFIGS_MULTIPLE_EXCLUDES)
+
+        bazelci.expand_task_config(config)
+        expanded_tasks = config["tasks"]
+        # Total combinations: 2 * 2 = 4, minus 2 excluded = 2
+        self.assertEqual(len(expanded_tasks), 2)
+        expanded_task_names = [task.get("name", None) for id, task in expanded_tasks.items()]
+        self.assertEqual(expanded_task_names, [
+            "Formatted w/ Bazel v1.2.3 on pf1",
+            "Formatted w/ Bazel v2.3.4 on pf2",
+        ])
+
+    def test_partial_attribute_exclude(self):
+        import copy
+        config = copy.deepcopy(self._CONFIGS_PARTIAL_EXCLUDE)
+
+        bazelci.expand_task_config(config)
+        expanded_tasks = config["tasks"]
+        # Total combinations: 2 * 2 = 4, minus 2 excluded (all pf2) = 2
+        self.assertEqual(len(expanded_tasks), 2)
+        expanded_task_names = [task.get("name", None) for id, task in expanded_tasks.items()]
+        self.assertEqual(expanded_task_names, [
+            "Formatted w/ Bazel v1.2.3 on pf1",
+            "Formatted w/ Bazel v2.3.4 on pf1",
+        ])
+
+    def test_dict_attribute_exclude(self):
+        import copy
+        config = copy.deepcopy(self._CONFIGS_DICT_EXCLUDE)
+
+        bazelci.expand_task_config(config)
+        expanded_tasks = config["tasks"]
+        # Total combinations: 2 * 2 = 4, minus 1 excluded = 3
+        self.assertEqual(len(expanded_tasks), 3)
+        expanded_task_names = [task.get("name", None) for id, task in expanded_tasks.items()]
+        # the name receives the friendly alias
+        self.assertEqual(expanded_task_names, [
+            "Formatted on pf1 with flags set-one",
+            "Formatted on pf1 with flags set-two",
+            "Formatted on pf2 with flags set-two",
+        ])
+        expanded_task_flags = [task.get("build_flags", None) for id, task in expanded_tasks.items()]
+        # but the flags get the real value
+        self.assertEqual(expanded_task_flags, [
+            ["--one", "--two"],
+            ["--three", "--four"],
+            ["--three", "--four"],
+        ])
+
+
+class ShellQuoting(unittest.TestCase):
+    """Regression tests: values interpolated into generated Buildkite step
+    commands must be shell-quoted so that unusual task names (which come from
+    user-controlled `.bazelci/presubmit.yml` dict keys) cannot break out of the
+    --task argument and inject extra shell commands."""
+
+    def _runner_command(self, step):
+        # create_step stores the list of shell commands under "command".
+        commands = step["command"]
+        for cmd in commands:
+            if "--task=" in cmd:
+                return cmd
+        self.fail("no command containing --task= was generated")
+
+    def _sentinel_path(self):
+        # A uniquely-named path that an unquoted injection would create as its
+        # side effect. We never create it ourselves, so it must not exist after
+        # the command is generated.
+        path = tempfile.mktemp(prefix="pwned.")
+        self.addCleanup(lambda: os.remove(path) if os.path.exists(path) else None)
+        return path
+
+    def test_runner_step_quotes_task_name(self):
+        sentinel = self._sentinel_path()
+        # If interpolated unquoted, the `;` would end the runner invocation and
+        # `touch <sentinel>` would run as a separate command.
+        task = "x; touch %s; #" % sentinel
+
+        step = bazelci.runner_step(
+            platform=bazelci.DEFAULT_PLATFORM,
+            task=task,
+            project_name="test",
+        )
+        cmd = self._runner_command(step)
+        # Parse the command exactly as a shell would.
+        tokens = shlex.split(cmd)
+        # The whole task name must survive as a single --task= argument...
+        self.assertIn("--task=" + task, tokens)
+        # ...the injected `touch` must NOT appear as its own token...
+        self.assertNotIn("touch", tokens)
+        # ...and the injection's side-effect file must never be created.
+        self.assertFalse(os.path.exists(sentinel))
+
+    def test_bazel_build_step_quotes_task_name(self):
+        sentinel = self._sentinel_path()
+        task = "x; touch %s; #" % sentinel
+
+        step = bazelci.bazel_build_step(
+            task=task,
+            platform=bazelci.DEFAULT_PLATFORM,
+            project_name="test",
+        )
+        cmd = self._runner_command(step)
+        tokens = shlex.split(cmd)
+        self.assertIn("--task=" + task, tokens)
+        self.assertNotIn("touch", tokens)
+        self.assertFalse(os.path.exists(sentinel))
+
+    def test_runner_step_quotes_config_arguments(self):
+        sentinel = self._sentinel_path()
+
+        step = bazelci.runner_step(
+            platform=bazelci.DEFAULT_PLATFORM,
+            task="ok",
+            project_name="test",
+            file_config="x; touch %s; #" % sentinel,
+            git_commit="$(touch %s)" % sentinel,
+        )
+        cmd = self._runner_command(step)
+        tokens = shlex.split(cmd)
+        self.assertIn("--file_config=x; touch %s; #" % sentinel, tokens)
+        self.assertIn("--git_commit=$(touch %s)" % sentinel, tokens)
+        self.assertNotIn("touch", tokens)
+        self.assertFalse(os.path.exists(sentinel))
+
+
+class InitialSteps(unittest.TestCase):
+    def test_blocks_config_changes_without_presubmit_auto_run_label(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BUILDKITE_BRANCH": "feature",
+                "BUILDKITE_PIPELINE_DEFAULT_BRANCH": "main",
+                "BUILDKITE_PULL_REQUEST_LABELS": "",
+            },
+        ), mock.patch.object(
+            bazelci, "get_modified_files", return_value=[".bazelci/presubmit.yml"]
+        ):
+            steps = bazelci.create_initial_steps()
+
+        self.assertEqual(len(steps), 1)
+        self.assertIn("block", steps[0])
+
+    def test_disallows_buildkite_changes(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BUILDKITE_BRANCH": "feature",
+                "BUILDKITE_PIPELINE_DEFAULT_BRANCH": "main",
+                "BUILDKITE_PULL_REQUEST_LABELS": "",
+            },
+        ):
+            with mock.patch.object(
+                bazelci, "get_modified_files", return_value=[".buildkite/hooks/post-checkout"]
+            ):
+                with self.assertRaisesRegex(
+                    bazelci.BuildkiteException, "continuous-integration"
+                ):
+                    bazelci.create_initial_steps()
+
+            with mock.patch.object(
+                bazelci, "get_modified_files", return_value=["docs/setup.buildkite.md"]
+            ):
+                self.assertEqual(bazelci.create_initial_steps(), [])
+
+    def test_disallows_symlink_to_buildkite(self):
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                os.chdir(tmpdir)
+                os.makedirs(os.path.join(".buildkite", "hooks"))
+                os.symlink("../../helper.sh", os.path.join(".buildkite", "hooks", "post-checkout"))
+                os.symlink(".buildkite/hooks/environment", "local_hook_link")
+                os.symlink("/etc/buildkite-agent/hooks/post-checkout", "agent_hook_link")
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "BUILDKITE_BRANCH": "feature",
+                        "BUILDKITE_PIPELINE_DEFAULT_BRANCH": "main",
+                        "BUILDKITE_PULL_REQUEST_LABELS": "",
+                    },
+                ):
+                    for modified in (
+                        [".buildkite/hooks/post-checkout", "helper.sh"],
+                        ["local_hook_link"],
+                        ["agent_hook_link"],
+                    ):
+                        with self.subTest(modified=modified), mock.patch.object(
+                            bazelci, "get_modified_files", return_value=modified
+                        ):
+                            with self.assertRaisesRegex(
+                                bazelci.BuildkiteException, "continuous-integration"
+                            ):
+                                bazelci.create_initial_steps()
+                    for win_relpath in (
+                        r".buildkite\hooks\environment",
+                        r"..\..\etc\buildkite-agent\hooks\post-checkout",
+                    ):
+                        with self.subTest(win_relpath=win_relpath), mock.patch.object(
+                            bazelci, "get_modified_files", return_value=["hook_link"]
+                        ), mock.patch("os.path.relpath", return_value=win_relpath):
+                            with self.assertRaisesRegex(
+                                bazelci.BuildkiteException, "continuous-integration"
+                            ):
+                                bazelci.create_initial_steps()
+            finally:
+                os.chdir(orig_cwd)
+
+    def test_presubmit_auto_run_label_skips_config_change_block(self):
+        for label in ("presubmit-auto-run", "CI:run"):
+            with self.subTest(label=label):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "BUILDKITE_BRANCH": "feature",
+                        "BUILDKITE_PIPELINE_DEFAULT_BRANCH": "main",
+                        "BUILDKITE_PULL_REQUEST_LABELS": f"foo,{label},bar",
+                    },
+                ), mock.patch.object(bazelci, "get_modified_files") as get_modified_files:
+                    steps = bazelci.create_initial_steps()
+                self.assertEqual(steps, [])
+                get_modified_files.assert_not_called()
+
+    def test_has_presubmit_auto_run_label(self):
+        with mock.patch.dict(os.environ, {"BUILDKITE_PULL_REQUEST_LABELS": ""}):
+            self.assertFalse(bazelci.has_presubmit_auto_run_label())
+        with mock.patch.dict(os.environ, {"BUILDKITE_PULL_REQUEST_LABELS": "foo,bar"}):
+            self.assertFalse(bazelci.has_presubmit_auto_run_label())
+        with mock.patch.dict(os.environ, {"BUILDKITE_PULL_REQUEST_LABELS": "presubmit-auto-run"}):
+            self.assertTrue(bazelci.has_presubmit_auto_run_label())
+        with mock.patch.dict(os.environ, {"BUILDKITE_PULL_REQUEST_LABELS": "foo,CI:run,bar"}):
+            self.assertTrue(bazelci.has_presubmit_auto_run_label())
+
+    def test_disable_modified_files_detection(self):
+        with mock.patch.dict(
+            os.environ, {"DISABLE_MODIFIED_FILES_DETECTION": "true"}
+        ), mock.patch.object(bazelci, "fetch_base_branch") as fetch_base_branch:
+            self.assertEqual(bazelci.get_modified_files("abc1234"), [])
+            fetch_base_branch.assert_not_called()
+
+class FetchCiScripts(unittest.TestCase):
+    def test_curl_download_command(self):
+        cmd = bazelci.curl_download_command("https://example.com/foo.py", "foo.py")
+        self.assertEqual(
+            cmd,
+            f"curl {bazelci.CURL_FLAGS_STR} https://example.com/foo.py -o foo.py",
+        )
+
+    def test_fetch_ci_scripts_command_returns_list_of_curl_commands(self):
+        cmds = bazelci.fetch_ci_scripts_command()
+        self.assertIsInstance(cmds, list)
+        self.assertEqual(len(cmds), 2)
+        self.assertTrue(cmds[0].startswith(f"curl {bazelci.CURL_FLAGS_STR}"))
+        self.assertIn("bazelci.py", cmds[0])
+        self.assertTrue(cmds[1].startswith(f"curl {bazelci.CURL_FLAGS_STR}"))
+        self.assertIn("collect_metrics.py", cmds[1])
+        # Verify no shell delimiter like ';' or '&&' is appended
+        self.assertFalse(cmds[0].endswith(";"))
+        self.assertFalse(cmds[0].endswith("&&"))
+
+    def test_create_step_flattens_nested_commands(self):
+        step = bazelci.create_step(
+            label="test",
+            commands=[
+                bazelci.fetch_ci_scripts_command(),
+                "echo hello",
+            ],
+            platform=bazelci.DEFAULT_PLATFORM,
+        )
+        self.assertEqual(len(step["command"]), 3)
+        self.assertIn("bazelci.py", step["command"][0])
+        self.assertIn("collect_metrics.py", step["command"][1])
+        self.assertEqual(step["command"][2], "echo hello")
+
+    def test_runner_step_includes_fetch_ci_scripts(self):
+        step = bazelci.runner_step(
+            platform=bazelci.DEFAULT_PLATFORM,
+            task="basic",
+            project_name="test",
+        )
+        commands = step["command"]
+        self.assertEqual(len(commands), 3)
+        self.assertIn("bazelci.py", commands[0])
+        self.assertIn("collect_metrics.py", commands[1])
+        self.assertIn("--task=basic", commands[2])
+
+
+class GetCiScriptRefTest(unittest.TestCase):
+
+    def test_production_returns_master(self):
+        with mock.patch.object(bazelci, "THIS_IS_TESTING", False):
+            self.assertEqual(bazelci.get_ci_script_ref(), "master")
+
+    def test_ci_repo_with_commit(self):
+        with mock.patch.object(bazelci, "THIS_IS_TESTING", True):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BUILDKITE_REPO": "https://github.com/bazelbuild/continuous-integration.git",
+                    "BUILDKITE_COMMIT": "deadbeef1234",
+                },
+                clear=True,
+            ):
+                self.assertEqual(bazelci.get_ci_script_ref(), "deadbeef1234")
+
+    def test_ci_repo_with_head_commit_uses_branch(self):
+        with mock.patch.object(bazelci, "THIS_IS_TESTING", True):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BUILDKITE_REPO": "https://github.com/bazelbuild/continuous-integration.git",
+                    "BUILDKITE_COMMIT": "HEAD",
+                    "BUILDKITE_BRANCH": "pr-branch-name",
+                },
+                clear=True,
+            ):
+                self.assertEqual(bazelci.get_ci_script_ref(), "pr-branch-name")
+
+    def test_other_repo_defaults_to_testing(self):
+        with mock.patch.object(bazelci, "THIS_IS_TESTING", True):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BUILDKITE_REPO": "https://github.com/bazelbuild/bazel.git",
+                    "BUILDKITE_COMMIT": "some_bazel_commit",
+                },
+                clear=True,
+            ):
+                self.assertEqual(bazelci.get_ci_script_ref(), "testing")
+
+    def test_fork_repo_defaults_to_testing(self):
+        with mock.patch.object(bazelci, "THIS_IS_TESTING", True):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BUILDKITE_REPO": "https://github.com/forkuser/continuous-integration.git",
+                    "BUILDKITE_COMMIT": "fork_commit",
+                },
+                clear=True,
+            ):
+                self.assertEqual(bazelci.get_ci_script_ref(), "testing")
+
+    def test_env_var_overrides_ref_in_testing(self):
+        with mock.patch.object(bazelci, "THIS_IS_TESTING", True):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BAZELCI_GITHUB_REF": "custom-test-branch",
+                    "BUILDKITE_REPO": "https://github.com/bazelbuild/bazel.git",
+                    "BUILDKITE_COMMIT": "some_bazel_commit",
+                },
+                clear=True,
+            ):
+                self.assertEqual(bazelci.get_ci_script_ref(), "custom-test-branch")
+
+    def test_env_var_ignored_in_production(self):
+        with mock.patch.object(bazelci, "THIS_IS_TESTING", False):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BAZELCI_GITHUB_REF": "custom-test-branch",
+                },
+                clear=True,
+            ):
+                self.assertEqual(bazelci.get_ci_script_ref(), "master")
+
+
+class GitBranchHandlingTest(unittest.TestCase):
+
+    def test_upload_project_pipeline_step_with_git_commit(self):
+        step = bazelci.upload_project_pipeline_step(
+            project_name="Protobuf 35.x",
+            git_repository="https://github.com/protocolbuffers/protobuf.git",
+            http_config=None,
+            file_config=".bazelci/presubmit.yml",
+            git_commit="origin/35.x",
+        )
+        commands = step["command"]
+        project_pipeline_cmd = [c for c in commands if "project_pipeline" in c][0]
+        self.assertIn("--git_commit=origin/35.x", project_pipeline_cmd)
+        self.assertIn("--project_name='Protobuf 35.x'", project_pipeline_cmd)
+        self.assertIn('--file_config=.bazelci/presubmit.yml', project_pipeline_cmd)
+
+    def test_print_bazel_downstream_pipeline_passes_origin_branch_as_git_commit(self):
+        test_projects = {
+            "Protobuf 35.x": {
+                "git_repository": "https://github.com/protocolbuffers/protobuf.git",
+                "git_branch": "35.x",
+                "file_config": ".bazelci/presubmit.yml",
+                "pipeline_slug": "protobuf",
+            }
+        }
+        with mock.patch.dict(bazelci.DOWNSTREAM_PROJECTS, test_projects, clear=True), \
+             mock.patch.object(bazelci, "upload_project_pipeline_step") as mock_upload, \
+             mock.patch.object(bazelci, "print_pipeline_steps"), \
+             mock.patch.object(bazelci, "bazel_build_step", return_value={"label": "Bazel"}), \
+             mock.patch.object(bazelci, "get_platform_for_task", return_value="ubuntu2004"):
+            bazelci.print_bazel_downstream_pipeline(
+                task_configs={"basic": {}},
+                http_config=None,
+                file_config=None,
+                test_disabled_projects=False,
+                notify=False,
+            )
+            mock_upload.assert_called_once_with(
+                project_name="Protobuf 35.x",
+                git_repository="https://github.com/protocolbuffers/protobuf.git",
+                http_config=None,
+                file_config=".bazelci/presubmit.yml",
+                git_commit="origin/35.x",
+            )
+
+    def test_get_last_green_commit_ignores_projects_with_git_branch(self):
+        with mock.patch.dict(
+            bazelci.DOWNSTREAM_PROJECTS,
+            {
+                "TestProject": {
+                    "git_repository": "https://github.com/foo/bar.git",
+                    "pipeline_slug": "bar",
+                    "git_branch": "35.x",
+                }
+            },
+            clear=True,
+        ):
+            self.assertIsNone(bazelci.get_last_green_commit("TestProject"))
+
+    def test_clone_git_repository_resets_to_git_commit(self):
+        executed_commands = []
+
+        def fake_execute(args, print_output=True, suppress_stdout=False):
+            executed_commands.append(args)
+
+        with mock.patch.object(bazelci, "execute_command", side_effect=fake_execute), \
+             mock.patch("os.path.exists", return_value=True), \
+             mock.patch("os.chdir"):
+            bazelci.clone_git_repository(
+                "https://github.com/protocolbuffers/protobuf.git",
+                git_commit="origin/35.x",
+                suppress_stdout=True,
+            )
+
+        self.assertIn(["git", "reset", "origin/35.x", "--hard"], executed_commands)
+
+
+class ExecuteCommandTimeout(unittest.TestCase):
+    def test_execute_command_raises_on_timeout(self):
+        with self.assertRaises(bazelci.subprocess.TimeoutExpired):
+            bazelci.execute_command(["sleep", "5"], timeout=0.2)
+
+    def test_upload_test_logs_from_bep_does_not_raise_on_timeout(self):
+        with mock.patch.object(
+            bazelci, "download_bazelci_agent", return_value="bazelci-agent"
+        ), mock.patch.object(
+            bazelci,
+            "execute_command",
+            side_effect=bazelci.subprocess.TimeoutExpired(cmd="bazelci-agent", timeout=7200),
+        ):
+            bazelci.upload_test_logs_from_bep("bep.json", "/tmp", monitor_flaky_tests=False)
+
+
+class EolPlatforms(unittest.TestCase):
+    _EOL_PLATFORM_FOR_TEST = sorted(bazelci.EOL_PLATFORMS)[0]
+    _SUPPORTED_PLATFORM_FOR_TEST = sorted(set(bazelci.PLATFORMS.keys()) - bazelci.EOL_PLATFORMS)[0]
+    _CONFIG_WITH_MULTIPLE_EOL_PLATFORMS = yaml.safe_load(f"""
+tasks:
+    foobar_eol:
+        platform: {_EOL_PLATFORM_FOR_TEST}
+    foobar_eol2:
+        platform: {_EOL_PLATFORM_FOR_TEST}
+""")
+    _CONFIG_WITH_SUPPORTED_PLATFORM = yaml.safe_load(f"""
+tasks:
+    foobar_supported:
+        platform: {_SUPPORTED_PLATFORM_FOR_TEST}
+""")
+
+    def get_steps_no_stdout(self, config):
+        # Silence stdout to avoid polluting console when running unit test
+        with mock.patch("sys.stdout") as _:
+            steps = bazelci.print_project_pipeline(
+                configs=config,
+                project_name="foobar_project",
+                http_config=None,
+                file_config=None,
+                git_repository=None,
+                git_commit=None,
+                monitor_flaky_tests=None,
+                notify=False,
+                print_shard_summary=False,
+            )
+            return steps
+
+    def get_eol_warning_steps(self, steps):
+        # Not every step has a label, e.g. "wait" steps or the "block" step that
+        # is added to presubmit builds that modify config files.
+        return [
+            s
+            for s in steps
+            if isinstance(s, dict) and "WARNING: EOL platform detected" in s.get("label", "")
+        ]
+
+    def test_multiple_eol_platform_has_warning(self):
+        steps = self.get_steps_no_stdout(self._CONFIG_WITH_MULTIPLE_EOL_PLATFORMS)
+        # Find all steps that contain the EOL warning
+        warning_steps = self.get_eol_warning_steps(steps)
+        # There should only be 1 warning step.
+        self.assertEqual(1, len(warning_steps))
+        # The step should only have 1 command.
+        self.assertEqual(1, len(warning_steps[0]["command"]))
+        # The warning message should be specific to the EOL platform.
+        warning_message = warning_steps[0]["command"][0]
+        self.assertTrue(self._EOL_PLATFORM_FOR_TEST in warning_message)
+        # The platform should only be listed once in the warning message.
+        # The list of EOL platforms exists from the first ":" to the subsequent ".".
+        platform_list = warning_message.split(":", 1)[1].split(".", 1)[0]
+        platforms = [p.strip() for p in platform_list.split(",")]
+        self.assertEqual([self._EOL_PLATFORM_FOR_TEST], platforms)
+
+    def test_supported_platform_has_no_warning(self):
+        steps = self.get_steps_no_stdout(self._CONFIG_WITH_SUPPORTED_PLATFORM)
+        # Find all steps that contain the EOL warning (there should be none)
+        warning_steps = self.get_eol_warning_steps(steps)
+        # There should be no warning steps.
+        self.assertEqual(0, len(warning_steps))
+
+
+class KytheKzipTest(unittest.TestCase):
+    def test_disallows_kzip_for_bazel_trusted(self):
+        with mock.patch.object(
+            bazelci, "BUILDKITE_ORG", "bazel-trusted"
+        ), mock.patch.object(bazelci, "execute_command") as mock_exec:
+            for index_upload_gcs in (False, True):
+                with self.subTest(index_upload_gcs=index_upload_gcs):
+                    with self.assertRaisesRegex(
+                        bazelci.BuildkiteException,
+                        "Kythe indexing not supported for org 'bazel-trusted'",
+                    ):
+                        bazelci.merge_and_upload_kythe_kzip(
+                            "ubuntu2404", index_upload_gcs=index_upload_gcs
+                        )
+            mock_exec.assert_not_called()
+
+    def test_uploads_kzip_for_supported_orgs(self):
+        expected_buckets = {
+            "bazel": "gs://bazel-kzips/",
+            "bazel-testing": "gs://bazel-kzips-testing/",
+        }
+        for org, bucket in expected_buckets.items():
+            with self.subTest(org=org):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "BUILDKITE_PIPELINE_SLUG": "bazel-bazel",
+                        "BUILDKITE_BRANCH": "master",
+                        "BUILDKITE_BUILD_NUMBER": "42",
+                        "BUILDKITE_COMMIT": "deadbeef",
+                    },
+                ), mock.patch.object(
+                    bazelci, "BUILDKITE_ORG", org
+                ), mock.patch.object(
+                    bazelci, "local_run_only", return_value=False
+                ), mock.patch.object(
+                    bazelci, "print_collapsed_group"
+                ), mock.patch.object(
+                    bazelci, "glob", return_value=["a.kzip"]
+                ), mock.patch.object(
+                    bazelci, "gsutil_command", return_value="gsutil"
+                ), mock.patch.object(
+                    bazelci, "execute_command"
+                ) as mock_exec:
+                    bazelci.merge_and_upload_kythe_kzip(
+                        "ubuntu2404", index_upload_gcs=True
+                    )
+
+                    expected_kzip = "42-ubuntu2404-deadbeef.kzip"
+                    self.assertEqual(
+                        mock_exec.call_args_list,
+                        [
+                            mock.call(
+                                [
+                                    f"{bazelci.KYTHE_DIR}/tools/kzip",
+                                    "merge",
+                                    "--output",
+                                    expected_kzip,
+                                    "a.kzip",
+                                ]
+                            ),
+                            mock.call(
+                                ["buildkite-agent", "artifact", "upload", expected_kzip]
+                            ),
+                            mock.call(
+                                [
+                                    "gsutil",
+                                    "cp",
+                                    expected_kzip,
+                                    f"{bucket}bazel-bazel/master/{expected_kzip}",
+                                ]
+                            ),
+                        ],
+                    )
+
+
+class SmokeTestConfigTest(unittest.TestCase):
+    """Verify that the smoke test stays in sync with all non-EOL platforms."""
+    def test_smoke_test_covers_all_supported_platforms(self):
+        smoke_test_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "smoke_test", "smoke_test.yml"
+        )
+        with open(smoke_test_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        smoke_platforms = set(config["matrix"]["platform"])
+        expected_platforms = {
+            p
+            for p in bazelci.PLATFORMS
+            if p not in bazelci.EOL_PLATFORMS
+            and p != "metrics_test_platform"
+            and (not p.startswith("rbe_") or p == "rbe_ubuntu2404")
+        }
+        self.assertEqual(smoke_platforms, expected_platforms)
+
+
+class TestBinPackingSharding(unittest.TestCase):
+    def _calculate_targets(self, platform="ubuntu2404"):
+        return bazelci.calculate_targets(
+            {}, "bazel", False, True, "/tmp", None, "abc", [], platform=platform
+        )[1]
+
+    def test_load_test_durations_and_metrics_platform(self):
+        self.assertEqual("linux", bazelci.get_metrics_platform("default"))
+        self.assertEqual("linux_arm64", bazelci.get_metrics_platform("arm64"))
+        self.assertIsNone(bazelci.get_metrics_platform(None))
+        ndjson = (
+            '{"target": "//pkg:t1", "platform": "macos_arm64", "duration": 120.0}\n'
+            '{"target": "//pkg:t2", "platform": "macos_arm64", "duration": 45.5}\n'
+            '{"target": "//pkg:t3", "platform": "linux", "duration": 80.0}\n'
+            '{"target": "//pkg:t3_arm", "platform": "linux_arm64", "duration": 95.0}\n'
+            '{"target": "//pkg:neg", "platform": "linux", "duration": -5}\n'
+            '{"target": "", "platform": "linux", "duration": 10.0}\n\n'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "durations.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(ndjson)
+            self.assertEqual({"//pkg:t1": 120.0, "//pkg:t2": 45.5}, bazelci.load_test_durations(path, "macos_arm64"))
+            self.assertEqual({"//pkg:t3": 80.0}, bazelci.load_test_durations(path, "ubuntu2404"))
+            self.assertEqual({"//pkg:t3_arm": 95.0}, bazelci.load_test_durations(path, "ubuntu2404_arm64"))
+            self.assertEqual({}, bazelci.load_test_durations(path, "windows"))
+            for bad in ("not json\n", '"not a dict"\n', '{"target": "//t", "duration": "bad"}\n'):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(bad)
+                with self.assertRaises(bazelci.BuildkiteInfraException):
+                    bazelci.load_test_durations(path, "linux")
+        with self.assertRaises(bazelci.BuildkiteInfraException):
+            bazelci.load_test_durations("/nonexistent/durations.json", "linux")
+
+    def test_partition_and_get_targets_for_shard(self):
+        targets = ["//heavy", "//s1", "//s2", "//s3", "//s4", "//s5"]
+        durations = {"//heavy": 1000.0, **{f"//s{i}": 200.0 for i in range(1, 6)}}
+        self.assertEqual(["//heavy"], bazelci.get_targets_for_shard(targets, 0, 2, durations))
+        self.assertEqual(["//s1", "//s2", "//s3", "//s4", "//s5"], bazelci.get_targets_for_shard(targets, 1, 2, durations))
+        self.assertEqual(["//heavy", "//s2", "//s4"], bazelci.get_targets_for_shard(targets, 0, 2, None))
+        with self.assertRaises(bazelci.BuildkiteException):
+            bazelci.get_targets_for_shard(targets, 2, 2)
+        ties = bazelci.partition_targets_bin_packing(["//z", "//y", "//x", "//w"], 2, {t: 10.0 for t in ["//z", "//y", "//x", "//w"]})
+        self.assertEqual({0: ["//w", "//y"], 1: ["//x", "//z"]}, ties)
+        median_pack = bazelci.partition_targets_bin_packing(["//k1", "//k2", "//k3", "//u"], 2, {"//k1": 100.0, "//k2": 300.0, "//k3": 500.0})
+        self.assertEqual({0: ["//k1", "//k3"], 1: ["//k2", "//u"]}, median_pack)
+
+    def test_upload_shard_distribution(self):
+        uploaded = {}
+
+        def capture(cmd, **_):
+            with open(cmd[3], encoding="utf-8") as f:
+                uploaded.update(json.load(f))
+
+        with mock.patch("bazelci.execute_command", side_effect=capture), mock.patch(
+            "bazelci.partition_targets_bin_packing", wraps=bazelci.partition_targets_bin_packing
+        ) as spy:
+            bazelci.upload_shard_distribution(["//a", "//b"], 2, test_durations={"//a": 10.0, "//b": 20.0})
+            spy.assert_called_once()
+        self.assertEqual({"1": ["//b"], "2": ["//a"]}, uploaded)
+
+    @mock.patch("bazelci.upload_shard_distribution")
+    @mock.patch("bazelci.expand_test_target_patterns", return_value=["//heavy", "//s1"])
+    def test_calculate_targets_smart_sharding_and_failure(self, mock_expand, mock_upload):
+        env = {"BUILDKITE_PARALLEL_JOB": "0", "BUILDKITE_PARALLEL_JOB_COUNT": "2", "USE_SMART_SHARDING": "true", "TEST_DURATIONS_GCS_GENERATION": "12345"}
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, env):
+            path = os.path.join(tmpdir, "d.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"target": "//heavy", "platform": "linux", "duration": 500.0}\n')
+            with mock.patch("bazelci.download_file", return_value=path) as mock_dl:
+                self.assertEqual(["//heavy"], self._calculate_targets())
+                self.assertEqual(f"{bazelci.TEST_DURATIONS_URL}#12345", mock_dl.call_args[0][0])
+                mock_upload.assert_called_once()
+                os.environ.pop("TEST_DURATIONS_GCS_GENERATION", None)
+                self.assertEqual(["//heavy"], self._calculate_targets())
+                self.assertEqual(bazelci.TEST_DURATIONS_URL, mock_dl.call_args[0][0])
+            with mock.patch("bazelci.download_file", side_effect=bazelci.BuildkiteInfraException("boom")):
+                with self.assertRaises(bazelci.BuildkiteInfraException):
+                    self._calculate_targets()
+
+    @mock.patch("time.sleep")
+    @mock.patch("bazelci.eprint")
+    @mock.patch("bazelci.print_pipeline_steps")
+    @mock.patch("bazelci.execute_command_and_get_output", return_value="  Generation:  98765\n")
+    def test_pipeline_pins_durations_generation(self, mock_stat, _, mock_eprint, mock_sleep):
+        cfg = {"tasks": {"ubuntu2404": {"shards": 2}, "macos": {}}}
+        with mock.patch.dict(os.environ, {"DISABLE_MODIFIED_FILES_DETECTION": "true"}, clear=False):
+            os.environ.pop("USE_SMART_SHARDING", None)
+            bazelci.print_project_pipeline(configs=cfg, project_name="p", http_config=None, file_config=None, git_repository=None)
+            mock_stat.assert_not_called()
+            with mock.patch.dict(os.environ, {"USE_SMART_SHARDING": "true"}):
+                steps = bazelci.print_project_pipeline(configs=cfg, project_name="p", http_config=None, file_config=None, git_repository=None)
+                self.assertEqual(["98765", "98765"], [s["env"]["TEST_DURATIONS_GCS_GENERATION"] for s in steps if "env" in s])
+                mock_stat.reset_mock()
+                mock_stat.side_effect = subprocess.CalledProcessError(1, "gsutil")
+                fallback_steps = bazelci.print_project_pipeline(configs=cfg, project_name="p", http_config=None, file_config=None, git_repository=None)
+        self.assertEqual(3, mock_stat.call_count)
+        mock_eprint.assert_called()
+        self.assertEqual([], [s for s in fallback_steps if "TEST_DURATIONS_GCS_GENERATION" in s.get("env", {})])
+
+    @mock.patch("time.sleep")
+    @mock.patch("bazelci.execute_command")
+    def test_download_file(self, mock_exec, mock_sleep):
+        bazelci.download_file("gs://b/f.json#1", "/tmp", "f.json")
+        self.assertEqual([bazelci.gsutil_command(), "cp", "gs://b/f.json#1"], mock_exec.call_args[0][0][:3])
+        bazelci.download_file("https://example.com/f.json", "/tmp", "f.json")
+        self.assertEqual("curl", mock_exec.call_args[0][0][0])
+        mock_exec.reset_mock()
+        mock_exec.side_effect = subprocess.CalledProcessError(1, "cmd", stderr=b"err")
+        with self.assertRaises(bazelci.BuildkiteInfraException):
+            bazelci.download_file("gs://b/f.json", "/tmp", "f.json")
+        self.assertEqual(3, mock_exec.call_count)
+
+
+class ExecuteBazelTest(unittest.TestCase):
+    @mock.patch.object(bazelci, "compute_flags", return_value=[])
+    @mock.patch.object(bazelci, "execute_command")
+    def test_disable_test_cache_env_var(self, mock_exec, _):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(bazelci.DISABLE_TEST_CACHE_ENV_VAR, None)
+            bazelci.execute_bazel_test("8.0.0", "bazel", "ubuntu2404", [], ["//..."], None, False)
+            self.assertNotIn("--nocache_test_results", mock_exec.call_args[0][0])
+
+            os.environ[bazelci.DISABLE_TEST_CACHE_ENV_VAR] = "1"
+            bazelci.execute_bazel_test("8.0.0", "bazel", "ubuntu2404", [], ["//..."], None, False)
+            self.assertIn("--nocache_test_results", mock_exec.call_args[0][0])
+
+
+class CommandQuotingTest(unittest.TestCase):
+    @staticmethod
+    def _parse_windows_bat_command(line):
+        """Simulate Windows .bat expansion + cmd.exe quote scan + MSVC UCRT argv parsing."""
+        if any(c in line for c in ("\r", "\n", "\x00")):
+            raise AssertionError("unescaped newline or NUL in batch line")
+
+        # 1. Batch percent processing: %% -> literal %, single % expands env/positional vars.
+        expanded = []
+        i = 0
+        while i < len(line):
+            if line[i] == "%":
+                if i + 1 < len(line) and line[i + 1] == "%":
+                    expanded.append("%")
+                    i += 2
+                    continue
+                raise AssertionError(f"unescaped % in batch line: {line!r}")
+            expanded.append(line[i])
+            i += 1
+        cmd_line = "".join(expanded)
+
+        # 2. cmd.exe tokenizer check: metacharacters must never appear outside "..." quote mode.
+        in_cmd_quotes = False
+        for ch in cmd_line:
+            if ch == '"':
+                in_cmd_quotes = not in_cmd_quotes
+            elif not in_cmd_quotes and ch in "&|<>()^;":
+                raise AssertionError(f"unquoted cmd.exe metacharacter {ch!r} in {cmd_line!r}")
+        if in_cmd_quotes:
+            raise AssertionError(f"unclosed quote in {cmd_line!r}")
+
+        # 3. MSVC UCRT parse_cmdline (used by python.exe on Windows).
+        args = []
+        i = 0
+        n = len(cmd_line)
+        while i < n:
+            while i < n and cmd_line[i] in (" ", "\t"):
+                i += 1
+            if i >= n:
+                break
+            cur = []
+            in_quotes = False
+            while i < n:
+                num_slashes = 0
+                while i < n and cmd_line[i] == "\\":
+                    num_slashes += 1
+                    i += 1
+                if i < n and cmd_line[i] == '"':
+                    cur.append("\\" * (num_slashes // 2))
+                    if num_slashes % 2 == 0:
+                        if in_quotes and i + 1 < n and cmd_line[i + 1] == '"':
+                            cur.append('"')
+                            i += 2
+                            continue
+                        in_quotes = not in_quotes
+                    else:
+                        cur.append('"')
+                    i += 1
+                    continue
+                cur.append("\\" * num_slashes)
+                if i >= n or (not in_quotes and cmd_line[i] in (" ", "\t")):
+                    break
+                cur.append(cmd_line[i])
+                i += 1
+            args.append("".join(cur))
+        return args
+
+    def test_runner_step_quotes_http_config_with_double_quotes_on_windows(self):
+        step = bazelci.runner_step(
+            platform="windows",
+            task="windows",
+            http_config="https://example.com/pipelines/grpc.yml?1793578021",
+            git_repository="https://github.com/grpc/grpc.git",
+            git_commit="deadbeef",
+        )
+        runner_cmd = step["command"][-1]
+        self.assertIn(
+            '--http_config="https://example.com/pipelines/grpc.yml?1793578021"',
+            runner_cmd,
+        )
+        self.assertNotIn("'", runner_cmd)
+        self.assertEqual(
+            self._parse_windows_bat_command(runner_cmd),
+            [
+                "python.exe",
+                "bazelci.py",
+                "runner",
+                "--task=windows",
+                "--http_config=https://example.com/pipelines/grpc.yml?1793578021",
+                "--git_repository=https://github.com/grpc/grpc.git",
+                "--git_commit=deadbeef",
+            ],
+        )
+
+    def test_runner_step_uses_shlex_quote_on_unix(self):
+        step = bazelci.runner_step(
+            platform="ubuntu2404",
+            task="ubuntu2404",
+            http_config="https://example.com/pipelines/grpc.yml?1793578021",
+        )
+        runner_cmd = step["command"][-1]
+        self.assertIn(
+            "--http_config='https://example.com/pipelines/grpc.yml?1793578021'",
+            runner_cmd,
+        )
+
+    def test_bazel_build_step_quotes_with_double_quotes_on_windows(self):
+        step = bazelci.bazel_build_step(
+            task="windows",
+            platform="windows",
+            project_name="Bazel",
+            http_config="https://example.com/pipelines/bazel.yml?123",
+        )
+        runner_cmd = step["command"][-1]
+        self.assertIn(
+            '--http_config="https://example.com/pipelines/bazel.yml?123"',
+            runner_cmd,
+        )
+        self.assertNotIn("'", runner_cmd)
+
+    def test_windows_quote_arg_prevents_cmd_injection_and_roundtrips(self):
+        tricky_values = [
+            "",
+            "simple",
+            "space in task",
+            'foo" & calc.exe & "',
+            'a\\"b',
+            'a""b',
+            'trailing_quote"',
+            "trailing_slash\\",
+            "trailing_slashes\\\\",
+            "%PATH% and %1 and https://example.com/a%20b?x=1&y=2",
+            "x; echo hi | calc.exe > out < in ^ (sub)",
+        ]
+        for val in tricky_values:
+            with self.subTest(val=val):
+                step = bazelci.runner_step(
+                    platform="windows",
+                    task=val,
+                    file_config=val if val else None,
+                )
+                runner_cmd = step["command"][-1]
+                argv = self._parse_windows_bat_command(runner_cmd)
+                self.assertIn("--task=" + val, argv)
+                if val:
+                    self.assertIn("--file_config=" + val, argv)
+
+    def test_windows_quote_arg_rejects_control_characters(self):
+        for bad in ("line1\nwhoami", "line1\rwhoami", "nul\x00byte"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(bazelci.BuildkiteException):
+                    bazelci.quote_arg("windows", bad)
+
+
+class RemoteCachingFlagsTest(unittest.TestCase):
+    def test_is_intel_mac(self):
+        self.assertTrue(bazelci.is_intel_mac("macos"))
+        self.assertFalse(bazelci.is_intel_mac("macos_arm64"))
+        self.assertFalse(bazelci.is_intel_mac("ubuntu2404"))
+        self.assertFalse(bazelci.is_intel_mac("windows"))
+
+        with mock.patch.object(bazelci.platform_module, "system", return_value="Darwin"):
+            with mock.patch.object(bazelci.platform_module, "machine", return_value="x86_64"):
+                self.assertTrue(bazelci.is_intel_mac())
+            with mock.patch.object(bazelci.platform_module, "machine", return_value="arm64"):
+                self.assertFalse(bazelci.is_intel_mac())
+
+        with mock.patch.object(bazelci.platform_module, "system", return_value="Linux"):
+            with mock.patch.object(bazelci.platform_module, "machine", return_value="x86_64"):
+                self.assertFalse(bazelci.is_intel_mac())
+
+    @mock.patch("subprocess.check_output", return_value=b"fake\n")
+    def test_macos_intel_uses_gcs_cache(self, _):
+        with mock.patch.object(bazelci, "is_mac", return_value=True):
+            flags = bazelci.remote_caching_flags("macos")
+            self.assertIn(
+                "--remote_cache=https://storage.googleapis.com/bazel-untrusted-build-cache",
+                flags,
+            )
+            self.assertNotIn(
+                "--remote_cache=remotebuildexecution.googleapis.com",
+                flags,
+            )
+            self.assertIn("--remote_timeout=3600", flags)
+            self.assertIn("--google_default_credentials", flags)
+
+    @mock.patch("subprocess.check_output", return_value=b"fake\n")
+    def test_macos_arm64_uses_rbe_cache(self, _):
+        with mock.patch.object(bazelci, "is_mac", return_value=True):
+            flags = bazelci.remote_caching_flags("macos_arm64")
+            self.assertIn(
+                "--remote_cache=remotebuildexecution.googleapis.com",
+                flags,
+            )
+            self.assertIn(
+                f"--remote_instance_name=projects/{bazelci.CLOUD_PROJECT}/instances/default_instance",
+                flags,
+            )
+            self.assertNotIn(
+                "--remote_cache=https://storage.googleapis.com/bazel-untrusted-build-cache",
+                flags,
+            )
+            self.assertIn("--remote_timeout=3600", flags)
+            self.assertIn("--google_default_credentials", flags)
+
+    def test_linux_uses_rbe_cache(self):
+        with mock.patch.object(bazelci, "is_mac", return_value=False):
+            flags = bazelci.remote_caching_flags("ubuntu2404")
+            self.assertIn(
+                "--remote_cache=remotebuildexecution.googleapis.com",
+                flags,
+            )
+            self.assertIn(
+                f"--remote_instance_name=projects/{bazelci.CLOUD_PROJECT}/instances/default_instance",
+                flags,
+            )
+            self.assertNotIn(
+                "--remote_cache=https://storage.googleapis.com/bazel-untrusted-build-cache",
+                flags,
+            )
+            self.assertIn("--remote_timeout=60", flags)
+            self.assertIn("--google_default_credentials", flags)
+            self.assertIn("--bes_backend=buildeventservice.googleapis.com", flags)
+
+    @mock.patch("subprocess.check_output", return_value=b"fake\n")
+    def test_macos_intel_trusted_uses_gcs_trusted_cache(self, _):
+        with mock.patch.object(bazelci, "is_mac", return_value=True), \
+             mock.patch.object(bazelci, "THIS_IS_TRUSTED", True):
+            flags = bazelci.remote_caching_flags("macos")
+            self.assertIn(
+                "--remote_cache=https://storage.googleapis.com/bazel-trusted-build-cache",
+                flags,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

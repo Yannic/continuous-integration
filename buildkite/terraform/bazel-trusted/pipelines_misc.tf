@@ -1,0 +1,523 @@
+resource "buildkite_pipeline" "update-git-mirror-tar-ball" {
+  name           = "Update git mirror tar ball"
+  repository     = "https://github.com/bazelbuild/continuous-integration.git"
+  description    = "Update the git mirrors (gs://bazel-git-mirror/bazelbuild-mirror.{tar,zip}) used when building VM image"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "cd ./gitbundle",
+        "sudo apt-get update && sudo apt-get install -y jq",
+        "./gitbundle.sh"
+      ],
+      label = "Creating git mirror tar ball",
+      image = "gcr.io/bazel-public/ubuntu2204@sha256:a8fc286aaca55230a3c2dddd3a5311770e6f609fa31f53447866c3b3bfb74398"
+    }
+  })
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    trigger_mode                                  = "code"
+    build_branches                                = true
+    build_pull_requests                           = true
+    build_tags                                    = false
+    build_pull_request_forks                      = false
+    build_pull_request_ready_for_review           = false
+    build_pull_request_labels_changed             = false
+    build_pull_request_base_branch_changed        = false
+    prefix_pull_request_fork_branch_names         = true
+    filter_enabled                                = false
+    pull_request_branch_filter_enabled            = false
+    publish_commit_status                         = true
+    publish_commit_status_per_step                = false
+    separate_pull_request_statuses                = false
+    publish_blocked_as_pending                    = true
+    cancel_deleted_branch_builds                  = false
+    skip_builds_for_existing_commits              = false
+    skip_pull_request_builds_for_existing_commits = true
+    ignore_default_branch_pull_requests           = false
+    build_merge_group_checks_requested            = false
+    cancel_when_merge_group_destroyed             = false
+    use_merge_group_base_commit_for_git_diff_base = false
+  }
+}
+
+resource "buildkite_pipeline_schedule" "update-git-mirror-tar-ball" {
+  pipeline_id = buildkite_pipeline.update-git-mirror-tar-ball.id
+  label       = "Update git mirror tar ball weekly"
+  branch      = "master"
+  cronline    = "0 3 * * 1" # Every Monday at 3 AM UTC
+}
+
+resource "buildkite_pipeline" "mirror-bazel-external-deps" {
+  name           = "Mirror Bazel External Deps"
+  repository     = "https://github.com/bazelbuild/bazel.git"
+  description    = "Mirror missing external repository artifacts for Bazel to gs://bazel-mirror"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "./tools/mirror_external_deps.py --upload"
+      ],
+      label = ":mirror: Mirror missing artifacts",
+      image = "gcr.io/bazel-public/ubuntu2204@sha256:a8fc286aaca55230a3c2dddd3a5311770e6f609fa31f53447866c3b3bfb74398"
+    }
+  })
+  allow_rebuilds             = true
+  branch_configuration       = "master"
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+resource "buildkite_pipeline" "bcr-integrity" {
+  name           = "BCR Integrity"
+  repository     = "https://github.com/bazelbuild/bazel-central-registry.git"
+  description    = "Calculate integrity value of source archive (for testing java_tools releases)"
+  default_branch = "main"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "bash -c 'set -euo pipefail; curl -s \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/java-tools-testing/pipelines/bcr-integrity.yml?$(date +%s)\" | tee /dev/tty | buildkite-agent pipeline upload --replace'"
+      ],
+      label = ":pipeline:"
+    }
+  })
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+resource "buildkite_pipeline" "create-linux-vm-image" {
+  name           = "Create Linux VM image"
+  repository     = "https://github.com/bazelbuild/continuous-integration.git"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {
+      BAZEL_TEST_VM_NAMES        = "bk-testing-docker,bk-testing-docker-arm64"
+      BAZEL_VM_NAMES             = "bk-docker,bk-docker-arm64"
+      BAZEL_PROD_INSTANCE_GROUPS = "bk-docker,bk-docker-arm64,bk-trusted-docker,bk-trusted-docker-arm64"
+    },
+    priority = 100,
+    steps = {
+      commands = [
+        "bash -c 'set -euo pipefail; curl -s \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/pipelines/publish-vm-image.yml?$(date +%s)\" | tee /dev/tty | buildkite-agent pipeline upload --replace'"
+      ],
+      label = ":pipeline:",
+      image = "gcr.io/bazel-public/ubuntu2204@sha256:a8fc286aaca55230a3c2dddd3a5311770e6f609fa31f53447866c3b3bfb74398"
+    }
+  })
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+# Mondays 04:00 UTC = Munich 05:00 CET / 06:00 CEST, New York Sun 23:00 EST / Mon 00:00 EDT
+# (outside Munich and New York working hours).
+resource "buildkite_pipeline_schedule" "create-linux-vm-image" {
+  pipeline_id = buildkite_pipeline.create-linux-vm-image.id
+  label       = "Create Linux VM image weekly"
+  branch      = "master"
+  cronline    = "0 4 * * 1"
+}
+
+resource "buildkite_pipeline" "collect-infra-ci-metrics" {
+  name           = "Collect Infra CI-Metrics"
+  repository     = "https://github.com/bazelbuild/continuous-integration.git"
+  description    = "Bazel's Continuous Integration Setup"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "cd buildkite",
+        "python3 -m pip install --upgrade pip setuptools wheel",
+        "python3 -m pip install pyyaml requests google-cloud-kms google-cloud-bigquery",
+        "python3 collect_infra_metrics.py"
+      ],
+      label = ":chart_with_upwards_trend: Collect Infra CI-Metrics",
+      image = "gcr.io/bazel-public/ubuntu2204@sha256:a8fc286aaca55230a3c2dddd3a5311770e6f609fa31f53447866c3b3bfb74398"
+    }
+  })
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+resource "buildkite_pipeline_schedule" "collect-infra-ci-metrics" {
+  pipeline_id = buildkite_pipeline.collect-infra-ci-metrics.id
+  label       = "Collect Metrics"
+  branch      = "master"
+  cronline    = "*/10 * * * *"
+  message     = "Collect Metrics"
+}
+
+resource "buildkite_pipeline" "create-linux-docker-images" {
+  name                       = "Create Linux Docker Images"
+  repository                 = "https://github.com/bazelbuild/continuous-integration.git"
+  default_branch             = "master"
+  steps                      = "---\npriority: 100\nsteps:\n  - command: |-\n      docker builder prune -a -f\n      cd buildkite/docker\n      [ \"$BUILDKITE_BRANCH\" = \"master\" ] || [ \"$BUILDKITE_BRANCH\" = \"testing\" ] && git checkout $BUILDKITE_BRANCH\n      echo \"--- Building docker images...\"\n      ./build.sh\n      echo \"--- Pushing docker images...\"\n      ./push.sh\n    label: \":pipeline: Create images\"\n    agents:\n      - \"queue=default\""
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    trigger_mode                                  = "code"
+    build_branches                                = true
+    build_pull_requests                           = true
+    build_tags                                    = false
+    build_pull_request_forks                      = false
+    build_pull_request_ready_for_review           = false
+    build_pull_request_labels_changed             = false
+    build_pull_request_base_branch_changed        = false
+    prefix_pull_request_fork_branch_names         = true
+    filter_enabled                                = false
+    pull_request_branch_filter_enabled            = false
+    publish_commit_status                         = true
+    publish_commit_status_per_step                = false
+    separate_pull_request_statuses                = false
+    publish_blocked_as_pending                    = true
+    cancel_deleted_branch_builds                  = false
+    skip_builds_for_existing_commits              = false
+    skip_pull_request_builds_for_existing_commits = true
+    ignore_default_branch_pull_requests           = false
+    build_merge_group_checks_requested            = false
+    cancel_when_merge_group_destroyed             = false
+    use_merge_group_base_commit_for_git_diff_base = false
+  }
+}
+
+resource "buildkite_pipeline_schedule" "create-linux-docker-images" {
+  pipeline_id    = buildkite_pipeline.create-linux-docker-images.id
+  label          = "Create Linux Docker images nightly"
+  branch         = "master"
+  cronline       = "0 4 * * *" # 4 AM UTC
+}
+
+resource "buildkite_pipeline" "docgen-bazel-website" {
+  name           = "DocGen: Bazel-website"
+  repository     = "https://github.com/bazelbuild/bazel-website.git"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "bash -c 'set -euo pipefail; curl -s \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/pipelines/bazel-docgen.yml?$(date +%s)\" | tee /dev/tty | buildkite-agent pipeline upload --replace'"
+      ],
+      label = ":pipeline:"
+    }
+  })
+  allow_rebuilds             = true
+  branch_configuration       = "master"
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+resource "buildkite_pipeline" "create-windows-vm-image" {
+  name           = "Create Windows VM image"
+  repository     = "https://github.com/bazelbuild/continuous-integration.git"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {
+      BAZEL_TEST_VM_NAMES        = "bk-testing-windows"
+      BAZEL_VM_NAMES             = "bk-windows"
+      BAZEL_PROD_INSTANCE_GROUPS = "bk-windows,bk-trusted-windows"
+    },
+    priority = 100,
+    steps = {
+      commands = [
+        "bash -c 'set -euo pipefail; curl -s \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/pipelines/publish-vm-image.yml?$(date +%s)\" | tee /dev/tty | buildkite-agent pipeline upload --replace'"
+      ],
+      label = ":pipeline:",
+      image = "gcr.io/bazel-public/ubuntu2204@sha256:a8fc286aaca55230a3c2dddd3a5311770e6f609fa31f53447866c3b3bfb74398"
+    }
+  })
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+# Mondays 05:00 UTC = Munich 06:00 CET / 07:00 CEST, New York Mon 00:00 EST / 01:00 EDT
+# (outside working hours; 1h after Linux so testing presubmits don't overlap bk-testing-docker recreate).
+resource "buildkite_pipeline_schedule" "create-windows-vm-image" {
+  pipeline_id = buildkite_pipeline.create-windows-vm-image.id
+  label       = "Create Windows VM image weekly"
+  branch      = "master"
+  cronline    = "0 5 * * 1"
+}
+
+resource "buildkite_pipeline" "docgen-bazel-blog" {
+  name           = "DocGen: Bazel-blog"
+  repository     = "https://github.com/bazelbuild/bazel-blog.git"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "bash -c 'set -euo pipefail; curl -s \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/pipelines/bazel-docgen.yml?$(date +%s)\" | tee /dev/tty | buildkite-agent pipeline upload --replace'"
+      ],
+      label = ":pipeline:"
+    }
+  })
+  allow_rebuilds             = true
+  branch_configuration       = "master"
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    trigger_mode                                  = "code"
+    build_branches                                = true
+    build_pull_requests                           = false
+    build_tags                                    = false
+    build_pull_request_forks                      = false
+    build_pull_request_ready_for_review           = false
+    build_pull_request_labels_changed             = false
+    build_pull_request_base_branch_changed        = false
+    prefix_pull_request_fork_branch_names         = true
+    filter_enabled                                = false
+    filter_condition                              = ""
+    pull_request_branch_filter_enabled            = false
+    pull_request_branch_filter_configuration      = ""
+    publish_commit_status                         = false
+    publish_commit_status_per_step                = false
+    separate_pull_request_statuses                = false
+    publish_blocked_as_pending                    = true
+    cancel_deleted_branch_builds                  = false
+    skip_builds_for_existing_commits              = false
+    skip_pull_request_builds_for_existing_commits = true
+    ignore_default_branch_pull_requests           = false
+    build_merge_group_checks_requested            = false
+    cancel_when_merge_group_destroyed             = false
+    use_merge_group_base_commit_for_git_diff_base = false
+  }
+}
+
+resource "buildkite_pipeline" "bcr-postsubmit" {
+  name           = "BCR Postsubmit"
+  repository     = "https://github.com/bazelbuild/bazel-central-registry.git"
+  description    = "Tasks to run after merging a change for the Bazel Central Registry"
+  default_branch = "main"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 75,
+    steps = {
+      commands = [
+        "curl -sS \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/buildkite/bazel-central-registry/bcr_postsubmit.py\" -o bcr_postsubmit.py",
+        "python3 bcr_postsubmit.py"
+      ],
+      label = ":pipeline:"
+    }
+  })
+  allow_rebuilds             = true
+  branch_configuration       = "main"
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    trigger_mode                                  = "code"
+    build_branches                                = true
+    build_pull_requests                           = false
+    build_tags                                    = false
+    build_pull_request_forks                      = false
+    build_pull_request_ready_for_review           = false
+    build_pull_request_labels_changed             = false
+    build_pull_request_base_branch_changed        = false
+    prefix_pull_request_fork_branch_names         = true
+    filter_enabled                                = false
+    filter_condition                              = ""
+    pull_request_branch_filter_enabled            = false
+    pull_request_branch_filter_configuration      = ""
+    publish_commit_status                         = true
+    publish_commit_status_per_step                = false
+    separate_pull_request_statuses                = false
+    publish_blocked_as_pending                    = true
+    cancel_deleted_branch_builds                  = false
+    skip_builds_for_existing_commits              = false
+    skip_pull_request_builds_for_existing_commits = true
+    ignore_default_branch_pull_requests           = false
+    build_merge_group_checks_requested            = false
+    cancel_when_merge_group_destroyed             = false
+    use_merge_group_base_commit_for_git_diff_base = false
+  }
+}
+
+resource "buildkite_pipeline" "docker-update" {
+  name           = "Docker update"
+  repository     = "https://github.com/bazelbuild/continuous-integration.git"
+  description    = "Build and publish docker container for new Bazel LTS releases"
+  default_branch = "master"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "bash -c 'set -euo pipefail; curl -s \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/pipelines/docker-update.yml?$(date +%s)\" | tee /dev/tty | buildkite-agent pipeline upload --replace'"
+      ],
+      label = ":pipeline:",
+      image = "gcr.io/bazel-public/ubuntu2404@sha256:4bc65868dcac6d63d5ecca1685c7a41e8549a5f38e041ff1f2edc8101cf213b8"
+    }
+  })
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+
+resource "buildkite_pipeline" "docgen-bazel" {
+  name           = "DocGen: Bazel"
+  repository     = "https://github.com/bazelbuild/bazel.git"
+  default_branch = "5.1-docs-fixes"
+  steps = templatefile("pipeline.yml.tpl", {
+    envs = {},
+    priority = 0,
+    steps = {
+      commands = [
+        "bash -c 'set -euo pipefail; curl -s \"https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/pipelines/bazel-docgen.yml?$(date +%s)\" | tee /dev/tty | buildkite-agent pipeline upload --replace'"
+      ],
+      label = ":pipeline:"
+    }
+  })
+  allow_rebuilds             = true
+  branch_configuration       = "5.1-docs-fixes"
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}
+
+resource "buildkite_pipeline" "bazel-ssl-certificate-checker" {
+  name                       = "Bazel SSL Certificate Checker"
+  repository                 = "https://github.com/bazelbuild/bazel.git"
+  description                = "a fast, scalable, multi-language and extensible build system"
+  default_branch             = "master"
+  steps                      = "---\npriority: 0\nsteps:\n  - command: |-\n      python3 .github/scripts/check_ssl.py\n    label: \":lock: SSL Certificate Checker\"\n    agents:\n      - \"queue=default\""
+  allow_rebuilds             = true
+  cancel_intermediate_builds = false
+  skip_intermediate_builds   = false
+  tags                       = []
+  branch_configuration       = null
+  cluster_id                 = null
+  color                      = null
+  default_team_id            = null
+  emoji                      = null
+  pipeline_template_id       = null
+  provider_settings = {
+    # GitHub activities are disabled for this pipeline
+    trigger_mode = "none"
+  }
+}

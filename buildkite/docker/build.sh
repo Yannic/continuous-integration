@@ -2,30 +2,111 @@
 
 set -euxo pipefail
 
-case $(git symbolic-ref --short HEAD) in
-    master)
-        PREFIX="bazel-public"
-        ;;
-    testing)
-        PREFIX="bazel-public/testing"
-        ;;
-    *)
-        echo "You must build Docker images either from the master or the testing branch!"
-        exit 1
-esac
+PREFIX=bazel-public
 
 # Enable use of buildkit for all builds. No extra support in the Dockerfile is required.
 # See https://docs.docker.com/develop/develop-images/build_enhancements/ for details.
 export DOCKER_BUILDKIT=1
 
-# Containers used by Bazel CI
-docker build -f centos7/Dockerfile    --target centos7-java8           -t "gcr.io/$PREFIX/centos7-java8" centos7
-docker build -f centos7/Dockerfile    --target centos7-releaser        -t "gcr.io/$PREFIX/centos7-releaser" centos7
-docker build -f debian10/Dockerfile   --target debian10-java11         -t "gcr.io/$PREFIX/debian10-java11" debian10
-docker build -f ubuntu1604/Dockerfile --target ubuntu1604-bazel-java8  -t "gcr.io/$PREFIX/ubuntu1604-bazel-java8" ubuntu1604
-docker build -f ubuntu1604/Dockerfile --target ubuntu1604-java8        -t "gcr.io/$PREFIX/ubuntu1604-java8" ubuntu1604
-docker build -f ubuntu1804/Dockerfile --target ubuntu1804-bazel-java11 -t "gcr.io/$PREFIX/ubuntu1804-bazel-java11" ubuntu1804
-docker build -f ubuntu1804/Dockerfile --target ubuntu1804-java11       -t "gcr.io/$PREFIX/ubuntu1804-java11" ubuntu1804
-docker build -f ubuntu2004/Dockerfile --target ubuntu2004-bazel-java11 -t "gcr.io/$PREFIX/ubuntu2004-bazel-java11" ubuntu2004
-docker build -f ubuntu2004/Dockerfile --target ubuntu2004-java11       -t "gcr.io/$PREFIX/ubuntu2004-java11" ubuntu2004
-docker build -f ubuntu2004/Dockerfile --target ubuntu2004-java11-kythe -t "gcr.io/$PREFIX/ubuntu2004-java11-kythe" ubuntu2004
+# --load only keeps all platforms of a multi-platform build when Docker uses
+# the containerd image store. With the classic store it silently keeps just
+# the host arch, and the push then wipes the other platforms from the tag.
+# Refuse to build in that case.
+if ! docker info -f '{{ .DriverStatus }}' | grep -q 'io.containerd.snapshotter'; then
+    echo "ERROR: containerd image store not enabled, multi-platform builds would" >&2
+    echo "drop non-native platforms. See https://docs.docker.com/engine/storage/containerd/" >&2
+    exit 1
+fi
+
+# We need a new builder using the docker-container driver in order
+# to build multi-platform images.
+if [[ -z "$(docker buildx ls | grep mp-builder)" ]]; then
+    docker buildx create --driver=docker-container --use --name mp-builder
+fi
+
+# Downloads the build tools once per run and bakes them into the images via a
+# named build context. Downloading them in each Dockerfile instead meant
+# excessive concurrent requests to GitHub, which would flakily 404.
+TOOLS_DIR="$(mktemp -d)"
+trap 'rm -rf "$TOOLS_DIR"' EXIT
+
+function latest_release_tag() {
+    local repo="$1"
+    local tag
+    tag=$(curl -sSI "https://github.com/${repo}/releases/latest" | grep -i '^location: ' | sed 's|.*/||' | sed $'s/\r//')
+    if [[ -z "$tag" ]]; then
+        echo "ERROR: could not determine the latest release of ${repo}" >&2
+        return 1
+    fi
+    echo "$tag"
+}
+
+# Every image is built for at most these architectures, so fetch both and let
+# each Dockerfile pick the one matching the image it is building.
+function download_tool() {
+    local repo="$1"
+    local tool="$2"
+    local tag
+    tag=$(latest_release_tag "$repo")
+    echo "Using ${tool} ${tag}"
+    local arch
+    for arch in amd64 arm64; do
+        curl -fsSLo "${TOOLS_DIR}/${tool}-linux-${arch}" \
+            "https://github.com/${repo}/releases/download/${tag}/${tool}-linux-${arch}"
+    done
+}
+
+download_tool bazelbuild/bazelisk bazelisk
+download_tool bazel-contrib/buildtools buildifier
+
+TOOLS_CONTEXT=(--build-context "tools=$TOOLS_DIR")
+
+# A function to build a docker image and only show logs (with --progress=plain) on failure.
+# This helps reduce the log size from 500MB to a few KB on success while still surfacing critical errors.
+function docker_build() {
+    local tag=""
+    local args=("$@")
+    for ((i=0; i<${#args[@]}; i++)); do
+        if [[ "${args[i]}" == "-t" ]]; then
+            tag="${args[i+1]}"
+            break
+        fi
+    done
+
+    local log=$(mktemp)
+    if ! docker build --progress=plain "$@" > "$log" 2>&1; then
+        echo "FAILED: $tag"
+        cat "$log"
+        rm "$log"
+        return 1
+    fi
+    echo "SUCCESS: $tag"
+    rm "$log"
+}
+
+# Containers used by Bazel
+# For Rocky Linux & Ubuntu we build multi-platform images.
+pids=()
+docker_build "${TOOLS_CONTEXT[@]}" -f rockylinux8/Dockerfile  --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target rockylinux8 -t "gcr.io/$PREFIX/rockylinux8"  rockylinux8 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f debian12/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target debian12-java17   -t "gcr.io/$PREFIX/debian12" debian12 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f debian13/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target debian13-java21   -t "gcr.io/$PREFIX/debian13" debian13 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f ubuntu2204/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target ubuntu2204-java17 -t "gcr.io/$PREFIX/ubuntu2204-java17" ubuntu2204 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f ubuntu2204/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target ubuntu2204        -t "gcr.io/$PREFIX/ubuntu2204" ubuntu2204 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f ubuntu2404/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target ubuntu2404        -t "gcr.io/$PREFIX/ubuntu2404" ubuntu2404 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f fedora43/Dockerfile   --target fedora43-java25   -t "gcr.io/$PREFIX/fedora43-java25" fedora43 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f fedora45/Dockerfile   --target fedora45-java25   -t "gcr.io/$PREFIX/fedora45-java25" fedora45 & pids+=($!)
+docker_build "${TOOLS_CONTEXT[@]}" -f ../../docgen/Dockerfile                          -t "gcr.io/$PREFIX/docgen" ../../docgen & pids+=($!)
+
+for pid in "${pids[@]}"; do
+    wait "$pid"
+done
+
+docker_build "${TOOLS_CONTEXT[@]}" -f rockylinux8/Dockerfile  --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target rockylinux8-java8               -t "gcr.io/$PREFIX/rockylinux8-java8"                 rockylinux8
+docker_build "${TOOLS_CONTEXT[@]}" -f rockylinux8/Dockerfile  --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target rockylinux8-java11              -t "gcr.io/$PREFIX/rockylinux8-java11"                rockylinux8
+docker_build "${TOOLS_CONTEXT[@]}" -f rockylinux8/Dockerfile  --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target rockylinux8-java11-devtoolset10 -t "gcr.io/$PREFIX/rockylinux8-java11-devtoolset10"   rockylinux8
+docker_build "${TOOLS_CONTEXT[@]}" -f rockylinux8/Dockerfile  --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target rockylinux8-releaser            -t "gcr.io/$PREFIX/rockylinux8-releaser"              rockylinux8
+docker_build "${TOOLS_CONTEXT[@]}" -f ubuntu2204/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target ubuntu2204-kythe            -t "gcr.io/$PREFIX/ubuntu2204-kythe" ubuntu2204
+docker_build "${TOOLS_CONTEXT[@]}" -f ubuntu2204/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target ubuntu2204-bazel-java17     -t "gcr.io/$PREFIX/ubuntu2204-bazel-java17" ubuntu2204
+docker_build "${TOOLS_CONTEXT[@]}" -f ubuntu2404/Dockerfile   --builder mp-builder --load --platform=linux/amd64,linux/arm64 --target ubuntu2404-kythe            -t "gcr.io/$PREFIX/ubuntu2404-kythe" ubuntu2404
+docker_build "${TOOLS_CONTEXT[@]}" -f fedora43/Dockerfile   --target fedora43-bazel-java25       -t "gcr.io/$PREFIX/fedora43-bazel-java25" fedora43
+docker_build "${TOOLS_CONTEXT[@]}" -f fedora45/Dockerfile   --target fedora45-bazel-java25       -t "gcr.io/$PREFIX/fedora45-bazel-java25" fedora45

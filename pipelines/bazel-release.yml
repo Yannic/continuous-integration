@@ -1,16 +1,15 @@
 ---
+priority: 50
 steps:
-  - label: "Get release name"
+  - label: "Set up"
     agents:
       - "queue=default"
     plugins:
       docker#v3.8.0:
         always-pull: true
         environment:
-          - ANDROID_HOME
-          - ANDROID_NDK_HOME
           - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
-        image: gcr.io/bazel-public/ubuntu1804-java11
+        image: gcr.io/bazel-public/ubuntu2404@sha256:4bc65868dcac6d63d5ecca1685c7a41e8549a5f38e041ff1f2edc8101cf213b8
         network: host
         privileged: true
         propagate-environment: true
@@ -19,10 +18,11 @@ steps:
         volumes:
           - "/etc/group:/etc/group:ro"
           - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
           - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
           - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
-          - "/var/run/docker.sock:/var/run/docker.sock"
     command: |
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
@@ -31,19 +31,27 @@ steps:
       echo "release_name = \"\$release_name\""
       buildkite-agent meta-data set "release_name" "\$release_name"
 
+      mode="release"
+      if [[ \"\$release_name\" =~ .*rc.* ]]; then
+        mode="rc"
+      fi
+      echo "mode = \"\$mode\""
+      buildkite-agent meta-data set "mode" "\$mode"
+
+      choco_key=$(gcloud secrets versions access latest --secret="choco-trusted-token" --project="bazel-public")
+      buildkite-agent meta-data set "choco_key" "\$choco_key"
+
   - wait
 
-  - label: "CentOS 7"
+  - label: "Rocky Linux 8"
     agents:
       - "queue=default"
     plugins:
       docker#v3.8.0:
         always-pull: true
         environment:
-          - ANDROID_HOME
-          - ANDROID_NDK_HOME
           - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
-        image: gcr.io/bazel-public/centos7-releaser
+        image: gcr.io/bazel-public/rockylinux8-releaser@sha256:2a61b4a50ea72e02764b54ac119b6dd64f96ae513401f71e1bbdff4470335306
         network: host
         privileged: true
         propagate-environment: true
@@ -52,10 +60,11 @@ steps:
         volumes:
           - "/etc/group:/etc/group:ro"
           - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
           - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
           - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
-          - "/var/run/docker.sock:/var/run/docker.sock"
     command: |
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
@@ -63,11 +72,28 @@ steps:
       release_name=$(buildkite-agent meta-data get "release_name")
       echo "release_name = \"\$release_name\""
 
-      bazel build --sandbox_tmpfs_path=/tmp //src:bazel
+      bazel build \
+          --remote_cache=remotebuildexecution.googleapis.com \
+          --remote_instance_name=projects/bazel-public/instances/default_instance \
+          --google_default_credentials \
+          --remote_timeout=60 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
+          --sandbox_tmpfs_path=/tmp \
+          //src:bazel
       mkdir output
       cp bazel-bin/src/bazel output/bazel
 
+      rm -f MODULE.bazel.lock
+      output/bazel mod deps --lockfile_mode=update
+
       output/bazel build \
+          --remote_cache=remotebuildexecution.googleapis.com \
+          --remote_instance_name=projects/bazel-public/instances/default_instance \
+          --google_default_credentials \
+          --remote_timeout=60 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
           -c opt \
           --stamp \
           --sandbox_tmpfs_path=/tmp \
@@ -79,6 +105,8 @@ steps:
           scripts/packages/debian/bazel-debian.deb \
           scripts/packages/debian/bazel.dsc \
           scripts/packages/debian/bazel.tar.gz \
+          scripts/bazel-complete.bash \
+          scripts/bazel.fish \
           bazel-distfile.zip
 
       mkdir artifacts
@@ -89,11 +117,14 @@ steps:
       cp "bazel-bin/scripts/packages/debian/bazel.dsc" "artifacts/bazel_\${release_name}.dsc"
       cp "bazel-bin/scripts/packages/debian/bazel.tar.gz" "artifacts/bazel_\${release_name}.tar.gz"
       cp "bazel-bin/bazel-distfile.zip" "artifacts/bazel-\${release_name}-dist.zip"
+      cp "bazel-bin/scripts/bazel-complete.bash" "artifacts/bazel-\${release_name}-completion.bash"
+      cp "bazel-bin/scripts/bazel.fish" "artifacts/bazel-\${release_name}-completion.fish"
+      cp "scripts/zsh_completion/_bazel" "artifacts/bazel-\${release_name}-completion.zsh"
 
       cd artifacts
       buildkite-agent artifact upload "*"
 
-  - label: "CentOS 7 (arm64)"
+  - label: "Rocky Linux 8 (arm64)"
     agents:
       - "queue=arm64"
     plugins:
@@ -101,7 +132,7 @@ steps:
         environment:
           - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
           - GOOGLE_APPLICATION_CREDENTIALS
-        image: gcr.io/bazel-public/centos7-releaser
+        image: gcr.io/bazel-public/rockylinux8-releaser@sha256:671ed89d34afaddb86770a7f0a54c7bb3decf91a8e31bbf1f8e33dd8164419b5
         network: host
         privileged: true
         propagate-environment: true
@@ -110,7 +141,9 @@ steps:
         volumes:
           - "/etc/group:/etc/group:ro"
           - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
           - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
           - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
     command: |
@@ -120,20 +153,36 @@ steps:
       release_name=$(buildkite-agent meta-data get "release_name")
       echo "release_name = \"\$release_name\""
 
-      bazel build --sandbox_tmpfs_path=/tmp //src:bazel
+      bazel build \
+          --remote_cache=remotebuildexecution.googleapis.com \
+          --remote_instance_name=projects/bazel-public/instances/default_instance \
+          --google_default_credentials \
+          --remote_timeout=60 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
+          --sandbox_tmpfs_path=/tmp \
+          //src:bazel
       mkdir output
       cp bazel-bin/src/bazel output/bazel
 
       output/bazel build \
+          --remote_cache=remotebuildexecution.googleapis.com \
+          --remote_instance_name=projects/bazel-public/instances/default_instance \
+          --google_default_credentials \
+          --remote_timeout=60 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
           -c opt \
           --stamp \
           --sandbox_tmpfs_path=/tmp \
           --embed_label "\${release_name}" \
           --workspace_status_command=scripts/ci/build_status_command.sh \
-          src/bazel
+          src/bazel \
+          src/bazel_nojdk
 
       mkdir artifacts
       cp "bazel-bin/src/bazel" "artifacts/bazel-\${release_name}-linux-arm64"
+      cp "bazel-bin/src/bazel_nojdk" "artifacts/bazel_nojdk-\${release_name}-linux-arm64"
 
       cd artifacts
       buildkite-agent artifact upload "*"
@@ -144,18 +193,28 @@ steps:
     command: |
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
+      unset ANDROID_HOME
+      unset ANDROID_NDK_HOME
 
       release_name=$(buildkite-agent meta-data get "release_name")
       echo "release_name = \"\$release_name\""
 
-      /usr/bin/sudo /usr/bin/xcode-select --switch /Applications/Xcode11.7.app
-      /usr/bin/sudo /usr/bin/xcodebuild -runFirstLaunch
-
-      bazel build //src:bazel
+      bazel build \
+          --remote_cache=https://storage.googleapis.com/bazel-trusted-build-cache \
+          --google_default_credentials \
+          --remote_timeout=3600 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
+          //src:bazel
       mkdir output
       cp bazel-bin/src/bazel output/bazel
 
       output/bazel build \
+          --remote_cache=https://storage.googleapis.com/bazel-trusted-build-cache \
+          --google_default_credentials \
+          --remote_timeout=3600 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
           --define IPHONE_SDK=1 \
           -c opt \
           --stamp \
@@ -175,9 +234,7 @@ steps:
 
   - label: macOS (arm64)
     agents:
-      # TODO(pcloudy): Switch to macos_arm64 queue when Apple Silicon machines are available,
-      # current we just use x86_64 machines to do cross compile.
-      - queue=macos
+      - queue=macos_arm64
     command: |
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
@@ -185,14 +242,22 @@ steps:
       release_name=$(buildkite-agent meta-data get "release_name")
       echo "release_name = \"\$release_name\""
 
-      /usr/bin/sudo /usr/bin/xcode-select --switch /Applications/Xcode12.4.app
-      /usr/bin/sudo /usr/bin/xcodebuild -runFirstLaunch
-
-      bazel build //src:bazel
+      bazel build \
+          --remote_cache=https://storage.googleapis.com/bazel-trusted-build-cache \
+          --google_default_credentials \
+          --remote_timeout=3600 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
+          //src:bazel
       mkdir output
       cp bazel-bin/src/bazel output/bazel
 
       output/bazel build \
+          --remote_cache=https://storage.googleapis.com/bazel-trusted-build-cache \
+          --google_default_credentials \
+          --remote_timeout=3600 \
+          --remote_max_connections=200 \
+          --remote_default_exec_properties=cache-silo-key=bazel-release \
           --define IPHONE_SDK=1 \
           -c opt \
           --stamp \
@@ -215,7 +280,7 @@ steps:
     agents:
       - queue=windows
     command: |
-      set BUILDKITE_MESSAGE=%BUILDKITE_MESSAGE:~0,1000%
+      set "BUILDKITE_MESSAGE=%BUILDKITE_MESSAGE:~0,1000%"
 
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
@@ -226,33 +291,64 @@ steps:
 
       echo Release: %RELEASE_NAME%
 
-      bazel build //src:bazel.exe
+      bazel build --remote_cache=remotebuildexecution.googleapis.com --remote_instance_name=projects/bazel-public/instances/default_instance --google_default_credentials --remote_timeout=60 --remote_max_connections=200 --remote_default_exec_properties=cache-silo-key=bazel-release //src:bazel.exe
       mkdir output
       copy bazel-bin\src\bazel.exe output\bazel.exe
 
-      output\bazel build -c opt --copt=-w --host_copt=-w --stamp --embed_label %RELEASE_NAME% src/bazel src/bazel_nojdk scripts/packages/bazel.zip
+      output\bazel build --remote_cache=remotebuildexecution.googleapis.com --remote_instance_name=projects/bazel-public/instances/default_instance --google_default_credentials --remote_timeout=60 --remote_max_connections=200 --remote_default_exec_properties=cache-silo-key=bazel-release -c opt --copt=-w --host_copt=-w --stamp --embed_label %RELEASE_NAME% src/bazel src/bazel_nojdk scripts/packages/bazel.zip scripts/packages/bazel_nojdk.zip
 
       mkdir artifacts
       move bazel-bin\src\bazel artifacts\bazel-%RELEASE_NAME%-windows-x86_64.exe
       move bazel-bin\src\bazel_nojdk artifacts\bazel_nojdk-%RELEASE_NAME%-windows-x86_64.exe
       move bazel-bin\scripts\packages\bazel.zip artifacts\bazel-%RELEASE_NAME%-windows-x86_64.zip
+      move bazel-bin\scripts\packages\bazel_nojdk.zip artifacts\bazel_nojdk-%RELEASE_NAME%-windows-x86_64.zip
+
+      cd artifacts
+      buildkite-agent artifact upload "*"
+
+  - label: Windows (arm64)
+    agents:
+      # TODO(pcloudy): Switch to windows_arm64 queue if Windows ARM64 machines are available,
+      # current we just use x86_64 machines to do cross compile.
+      - queue=windows
+    command: |
+      set "BUILDKITE_MESSAGE=%BUILDKITE_MESSAGE:~0,1000%"
+
+      git fetch origin ${BUILDKITE_BRANCH}
+      git checkout ${BUILDKITE_BRANCH}
+
+      buildkite-agent meta-data get "release_name" > release_name.txt
+      SET /p RELEASE_NAME=<release_name.txt
+      DEL /q release_name.txt
+
+      echo Release: %RELEASE_NAME%
+
+      bazel build --remote_cache=remotebuildexecution.googleapis.com --remote_instance_name=projects/bazel-public/instances/default_instance --google_default_credentials --remote_timeout=60 --remote_max_connections=200 --remote_default_exec_properties=cache-silo-key=bazel-release //src:bazel.exe
+      mkdir output
+      copy bazel-bin\src\bazel.exe output\bazel.exe
+
+      output\bazel build --remote_cache=remotebuildexecution.googleapis.com --remote_instance_name=projects/bazel-public/instances/default_instance --google_default_credentials --remote_timeout=60 --remote_max_connections=200 --remote_default_exec_properties=cache-silo-key=bazel-release -c opt --config=windows_arm64 --copt=-w --host_copt=-w --stamp --embed_label %RELEASE_NAME% src/bazel src/bazel_nojdk scripts/packages/bazel.zip scripts/packages/bazel_nojdk.zip
+
+      mkdir artifacts
+      move bazel-bin\src\bazel artifacts\bazel-%RELEASE_NAME%-windows-arm64.exe
+      move bazel-bin\src\bazel_nojdk artifacts\bazel_nojdk-%RELEASE_NAME%-windows-arm64.exe
+      move bazel-bin\scripts\packages\bazel.zip artifacts\bazel-%RELEASE_NAME%-windows-arm64.zip
+      move bazel-bin\scripts\packages\bazel_nojdk.zip artifacts\bazel_nojdk-%RELEASE_NAME%-windows-arm64.zip
 
       cd artifacts
       buildkite-agent artifact upload "*"
 
   - wait
 
-  - label: "Test on CentOS 7"
+  - label: "Test on Rocky Linux 8"
     agents:
       - "queue=default"
     plugins:
       docker#v3.8.0:
         always-pull: true
         environment:
-          - ANDROID_HOME
-          - ANDROID_NDK_HOME
           - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
-        image: gcr.io/bazel-public/centos7-java8
+        image: gcr.io/bazel-public/rockylinux8-java8@sha256:6b7c65df5b96c891b7b7796e7a0d75eb4eaab3bda3acf4b40e02b9cc691d152b
         network: host
         privileged: true
         propagate-environment: true
@@ -261,10 +357,11 @@ steps:
         volumes:
           - "/etc/group:/etc/group:ro"
           - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
           - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
           - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
-          - "/var/run/docker.sock:/var/run/docker.sock"
     command: |
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
@@ -278,7 +375,7 @@ steps:
 
       "./bazel-\${release_name}-linux-x86_64" info
 
-  - label: "Test on CentOS 7 (arm64)"
+  - label: "Test on Rocky Linux 8 (arm64)"
     agents:
       - "queue=arm64"
     plugins:
@@ -286,7 +383,7 @@ steps:
         environment:
           - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
           - GOOGLE_APPLICATION_CREDENTIALS
-        image: gcr.io/bazel-public/centos7-java8
+        image: gcr.io/bazel-public/rockylinux8-java8@sha256:5dc9ad02c7e152fb8b7510e5f18723b21171e67a9d8e9a71b262bf72214ea0b1
         network: host
         privileged: true
         propagate-environment: true
@@ -295,7 +392,9 @@ steps:
         volumes:
           - "/etc/group:/etc/group:ro"
           - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
           - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
           - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
     command: |
@@ -329,9 +428,8 @@ steps:
 
   - label: "Test on macOS (arm64)"
     agents:
-      # TODO(pcloudy): Switch to macos_arm64 queue and write a proper test step
-      # when Apple Silicon machines are available,
-      - queue=macos
+      # TODO(pcloudy): Write a proper test step
+      - queue=macos_arm64
     command: |
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
@@ -341,14 +439,14 @@ steps:
 
       buildkite-agent artifact download "bazel-\${release_name}-darwin-arm64" .
 
-      output=$(lipo -info "bazel-\${release_name}-darwin-arm64")
-      [[ \${output} == *"architecture: arm64"* ]] || (echo "architecture arm64 expected, but got: \"\${output}\"" && exit 1)
+      chmod +x "bazel-\${release_name}-darwin-arm64"
+      "./bazel-\${release_name}-darwin-arm64" info
 
   - label: "Test on Windows"
     agents:
       - queue=windows
     command: |
-      set BUILDKITE_MESSAGE=%BUILDKITE_MESSAGE:~0,1000%
+      set "BUILDKITE_MESSAGE=%BUILDKITE_MESSAGE:~0,1000%"
 
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
@@ -363,6 +461,27 @@ steps:
 
       bazel-%RELEASE_NAME%-windows-x86_64.exe info
 
+  - label: "Test on Windows (arm64)"
+    agents:
+      # TODO(pcloudy): Switch to windows_arm64 queue if Windows ARM64 machines are available,
+      # current we just use x86_64 machines to do cross compile.
+      - queue=windows
+    command: |
+      set "BUILDKITE_MESSAGE=%BUILDKITE_MESSAGE:~0,1000%"
+
+      git fetch origin ${BUILDKITE_BRANCH}
+      git checkout ${BUILDKITE_BRANCH}
+
+      buildkite-agent meta-data get "release_name" > release_name.txt
+      SET /p RELEASE_NAME=<release_name.txt
+      DEL /q release_name.txt
+
+      echo Release: %RELEASE_NAME%
+
+      buildkite-agent artifact download bazel-%RELEASE_NAME%-windows-arm64.exe .
+
+      file bazel-%RELEASE_NAME%-windows-arm64.exe | grep -E "(ARM64|Aarch64)"
+
   - wait
 
   - block: ":rocket: Deploy release artifacts"
@@ -374,10 +493,8 @@ steps:
       docker#v3.8.0:
         always-pull: true
         environment:
-          - ANDROID_HOME
-          - ANDROID_NDK_HOME
           - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
-        image: gcr.io/bazel-public/ubuntu1804-java11
+        image: gcr.io/bazel-public/ubuntu2404@sha256:4bc65868dcac6d63d5ecca1685c7a41e8549a5f38e041ff1f2edc8101cf213b8
         network: host
         privileged: true
         propagate-environment: true
@@ -386,12 +503,23 @@ steps:
         volumes:
           - "/etc/group:/etc/group:ro"
           - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
           - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
           - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
-          - "/var/run/docker.sock:/var/run/docker.sock"
     command: |
-      echo "+++ Fetching Git notes"
+      echo "+++ Installing required packages"
+      sudo apt -y update && sudo apt -y install devscripts pandoc reprepro
+
+      echo "+++ Installing GitHub CLI"
+      sudo mkdir -p -m 755 /etc/apt/keyrings
+      wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+      sudo chmod 644 /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+      sudo apt update && sudo apt install -y gh
+
+      echo "+++ Checking out Git branch"
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
 
@@ -402,7 +530,7 @@ steps:
       echo "+++ Importing GPG release key"
       keyfile="$(mktemp --tmpdir)"
       chmod 0600 "\${keyfile}"
-      gsutil cat "gs://bazel-trusted-encrypted-secrets/release-key.gpg.enc" | gcloud kms decrypt --project "bazel-public" --location "global" --keyring "buildkite" --key "bazel-release-key" --ciphertext-file "-" --plaintext-file "\${keyfile}"
+      gcloud secrets versions access latest --secret="bazel-release-key" --project="bazel-public" --out-file="\${keyfile}"
       gpg --allow-secret-key-import --import "\${keyfile}"
       rm -f "\${keyfile}"
 
@@ -410,34 +538,76 @@ steps:
       source scripts/ci/build.sh
       deploy_release "\${ARTIFACTS}"
 
-  - block: ":e-mail: Generate announcement mail text"
+  - block: ":e-mail: Generate release notes"
+    if: build.branch =~ /rc/i
 
-  - label: "Generate announcement mail text"
+  - label: "Generate release notes"
+    if: build.branch =~ /rc/i
     agents:
       - "queue=default"
-    plugins:
-      docker#v3.8.0:
-        always-pull: true
-        environment:
-          - ANDROID_HOME
-          - ANDROID_NDK_HOME
-          - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
-        image: gcr.io/bazel-public/ubuntu1804-java11
-        network: host
-        privileged: true
-        propagate-environment: true
-        propagate-uid-gid: true
-        shell: ["/bin/bash", "-e", "-c"]
-        volumes:
-          - "/etc/group:/etc/group:ro"
-          - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
-          - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
-          - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
-          - "/var/run/docker.sock:/var/run/docker.sock"
     command: |
+      echo "+++ Checking out Git branch"
       git fetch origin ${BUILDKITE_BRANCH}
       git checkout ${BUILDKITE_BRANCH}
 
-      source scripts/ci/build.sh
-      generate_email
+      echo "+++ Generating release notes"
+      cd scripts/release
+      python3 relnotes.py
+    soft_fail: true
+
+  - wait
+
+  - block: "Build and publish"
+    if: build.branch !~ /pre/i
+
+  - label: "Update Chocolatey"
+    if: build.branch !~ /pre/i
+    agents:
+      - queue=windows
+    command: |
+      echo "+++ Checking out Git branch"
+      git fetch origin ${BUILDKITE_BRANCH}
+      git checkout ${BUILDKITE_BRANCH}
+
+      echo "+++ Getting release info"
+      buildkite-agent meta-data get "release_name" > release_name.txt
+      SET /p RELEASE_NAME=<release_name.txt
+      DEL /q release_name.txt
+      echo Release: %RELEASE_NAME%
+
+      buildkite-agent meta-data get "mode" > mode.txt
+      SET /p MODE=<mode.txt
+      DEL /q mode.txt
+      echo Mode: %MODE%
+
+      buildkite-agent meta-data get "choco_key" > choco_key.txt
+      SET /p KEY=<choco_key.txt
+      DEL /q choco_key.txt
+
+      echo "+++ Authenticating"
+      cd "scripts/packages/chocolatey"
+      choco apikey -k %KEY% -s https://push.chocolatey.org/
+
+      SET RC=0
+      SET VERSION=%RELEASE_NAME%
+      if "%MODE%"=="rc" (
+        SET RC=%RELEASE_NAME:~-1%
+        SET VERSION=%RELEASE_NAME:~0,-3%
+      )
+      echo RC: %RC%
+      echo VERSION: %VERSION%
+
+      echo "+++ Building package"
+      powershell -Command "./build.ps1 -version %VERSION% -mode %MODE% -rc %RC%"
+
+      echo "+++ Pushing package"
+      choco push --source https://push.chocolatey.org/
+
+  - label: "Update Docker"
+    if: |
+      build.branch !~ /pre/i && build.branch !~ /rc/i
+    trigger: "docker-update"
+    build:
+      message: "${BUILDKITE_MESSAGE}"
+      env:
+        release_name: "${BUILDKITE_BRANCH}"

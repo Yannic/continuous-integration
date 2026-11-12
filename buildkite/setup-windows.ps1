@@ -11,6 +11,22 @@ Add-Type -AssemblyName "System.IO.Compression.FileSystem"
 ## Use TLS1.2 for HTTPS (fixes an issue where later steps can't connect to github.com)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+function Write-SerialLog($msg) {
+    $port = New-Object System.IO.Ports.SerialPort COM1,9600,None,8,one
+    $port.Open()
+    $port.WriteLine("[setup-windows.ps1]: $msg")
+    $port.Close()
+}
+
+## If choco is already installed, this is the second time the VM starts up, run GCESysprep and then shutdown
+if (Get-Command choco -ErrorAction SilentlyContinue) {
+    Write-SerialLog "choco is already installed, this is the second time the VM starts up, running GCESysprep and then shutdown..."
+    GCESysprep
+    exit 0
+}
+
+Write-SerialLog "Starting to setup windows... This could take up to one hour, check C:/setup-stdout.log on the VM for progress."
+
 ## Create C:\temp
 Write-Host "Creating temporary folder C:\temp..."
 if (-Not (Test-Path "c:\temp")) {
@@ -33,6 +49,7 @@ Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
 ## Disable Windows Defender.
 Write-Host "Disabling Windows Defender..."
 Set-MpPreference -DisableRealtimeMonitoring $true
+Set-MpPreference -DisableBehaviorMonitoring $true
 Uninstall-WindowsFeature -Name "Windows-Defender"
 
 ## Set system timezone.
@@ -57,6 +74,7 @@ Write-Host "Installing NTFSSecurity module..."
 Install-Module NTFSSecurity
 
 ## Install Chocolatey
+Write-SerialLog "Installing Chocolatey packages (curl, llvm, msys2)..."
 Write-Host "Installing Chocolatey..."
 # Chocolatey adds "C:\ProgramData\chocolatey\bin" to global PATH.
 Invoke-Expression ((New-Object Net.WebClient).DownloadString("https://chocolatey.org/install.ps1"))
@@ -71,14 +89,14 @@ Write-Host "Installing curl..."
 ## Install LLVM/Clang
 Write-Host "Installing llvm..."
 # FYI: choco installs clang in C:\Program Files\LLVM\bin (which is not on the PATH).
-& choco install llvm --version=10.0.0
+& choco install llvm
 [Environment]::SetEnvironmentVariable("BAZEL_LLVM", "C:\Program Files\LLVM", "Machine")
 $env:BAZEL_LLVM = [Environment]::GetEnvironmentVariable("BAZEL_LLVM", "Machine")
 
 ## Install MSYS2
 Write-Host "Installing MSYS2..."
 & choco install msys2
-$env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";C:\tools\msys64\usr\bin"
+$env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";C:\tools\msys64\usr\bin;C:\tools\msys64\mingw64\bin"
 [Environment]::SetEnvironmentVariable("PATH", $env:PATH, "Machine")
 
 [Environment]::SetEnvironmentVariable("BAZEL_SH", "C:\tools\msys64\usr\bin\bash.exe", "Machine")
@@ -86,11 +104,13 @@ $env:BAZEL_SH = [Environment]::GetEnvironmentVariable("BAZEL_SH", "Machine")
 Set-Alias bash "c:\tools\msys64\usr\bin\bash.exe"
 
 ## Install MSYS2 packages required by Bazel.
+Write-SerialLog "Updating MSYS2 packages with pacman..."
 Write-Host "Installing required MSYS2 packages..."
 & bash -lc "pacman --noconfirm -Syuu"
 & bash -lc "pacman --noconfirm --needed -S curl zip unzip gcc tar diffutils patch perl mingw-w64-x86_64-gcc ed"
 
 ## Install Git for Windows.
+Write-SerialLog "Installing Git for Windows..."
 Write-Host "Installing Git for Windows..."
 # FYI: choco adds "C:\Program Files\Git\cmd" to global PATH.
 & choco install git --params "'/GitOnlyOnPath'"
@@ -100,52 +120,78 @@ $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine")
 # Turn on long path support on Windows
 & git config --system core.longpaths true
 
-## Install Azul Zulu.
-Write-Host "Installing OpenJDK..."
-$zulu_filename = "zulu11.48.21-ca-jdk11.0.11-win_x64.zip"
-$zulu_url = "https://cdn.azul.com/zulu/bin/${zulu_filename}"
-$zulu_zip = "c:\temp\${zulu_filename}"
-$zulu_extracted_path = "c:\temp\" + [IO.Path]::GetFileNameWithoutExtension($zulu_zip)
-$zulu_root = "c:\openjdk"
-(New-Object Net.WebClient).DownloadFile($zulu_url, $zulu_zip)
-[System.IO.Compression.ZipFile]::ExtractToDirectory($zulu_zip, "c:\temp")
-Move-Item $zulu_extracted_path -Destination $zulu_root
-Remove-Item $zulu_zip
-$env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";${zulu_root}\bin"
+# Function to install Azul Zulu JDK
+function InstallAzulZuluJDK($filename, $rootPath) {
+    $url = "https://cdn.azul.com/zulu/bin/${filename}"
+    $zip = "c:\temp\${filename}"
+    $extractedPath = "c:\temp\" + [IO.Path]::GetFileNameWithoutExtension($zip)
+    $destination = "${rootPath}"
+
+    (New-Object Net.WebClient).DownloadFile($url, $zip)
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, "c:\temp")
+    Move-Item $extractedPath -Destination $destination
+    Remove-Item $zip
+}
+
+## Install Azul Zulu JDK 11
+Write-SerialLog "Installing Azul Zulu JDKs (11, 21)..."
+Write-Host "Installing Azul Zulu JDK 11..."
+InstallAzulZuluJDK "zulu11.52.13-ca-jdk11.0.13-win_x64.zip" "c:\openjdk11"
+
+## Install Azul Zulu JDK 21
+Write-Host "Installing Azul Zulu JDK 21..."
+InstallAzulZuluJDK "zulu21.28.85-ca-jdk21.0.0-win_x64.zip" "c:\openjdk21"
+
+## Set default JDK to Zulu 21
+$jdk_root = "c:\openjdk21"
+$env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";${jdk_root}\bin"
 [Environment]::SetEnvironmentVariable("PATH", $env:PATH, "Machine")
-$env:JAVA_HOME = $zulu_root
+$env:JAVA_HOME = $jdk_root
 [Environment]::SetEnvironmentVariable("JAVA_HOME", $env:JAVA_HOME, "Machine")
 
 ## Install Visual C++ 2017 Build Tools.
+Write-SerialLog "Installing Visual C++ 2017 Build Tools..."
 Write-Host "Installing Visual C++ 2017 Build Tools..."
 & choco install visualstudio2017buildtools
 & choco install visualstudio2017-workload-vctools --params "--add Microsoft.VisualStudio.Component.VC.Tools.ARM --add Microsoft.VisualStudio.Component.VC.Tools.ARM64"
-[Environment]::SetEnvironmentVariable("BAZEL_VC", "C:\Program Files (x86)\Microsoft Visual Studio\2017\BuildTools\VC", "Machine")
-$env:BAZEL_VC = [Environment]::GetEnvironmentVariable("BAZEL_VC", "Machine")
 
 ## Install Visual C++ 2019 Build Tools.
+Write-SerialLog "Installing Visual C++ 2019 Build Tools..."
 Write-Host "Installing Visual C++ 2019 Build Tools..."
 & choco install visualstudio2019buildtools
 & choco install visualstudio2019-workload-vctools --params "--add Microsoft.VisualStudio.Component.VC.Tools.ARM --add Microsoft.VisualStudio.Component.VC.Tools.ARM64"
 
-## Install Windows 10 SDK
-## https://github.com/bazelbuild/continuous-integration/issues/768
-& choco install windows-sdk-10-version-2004-all
+## Install Visual C++ 2022 Build Tools.
+Write-SerialLog "Installing Visual C++ 2022 Build Tools..."
+Write-Host "Installing Visual C++ 2022 Build Tools..."
+$tool_version="14.39.17.9."
+& choco install visualstudio2022buildtools
+# & choco install visualstudio2022-workload-vctools --params "--add Microsoft.VisualStudio.Component.VC.Tools.ARM --add Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+& choco install visualstudio2022-workload-vctools --params "--add Microsoft.VisualStudio.Component.VC.${tool_version}x86.x64 --add Microsoft.VisualStudio.Component.VC.${tool_version}ARM --add Microsoft.VisualStudio.Component.VC.${tool_version}ARM64"
 
-## Install Python2
-Write-Host "Installing Python 2..."
-& choco install python2 --params "/InstallDir:C:\python2"
-$env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+## Prevent mysteirous failure caused by newer version of MSVC (14.40.33810). See https://github.com/bazelbuild/bazel/issues/22656
+## Remove directories under C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC that don't match the specified version.
+$versionPrefix = "14.39" # The installed version doesn't match the version in the component name, so we need to use a substring match.
+$msvcPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC"
+$directories = Get-ChildItem -Path $msvcPath -Directory | Where-Object { $_.Name -notlike "$versionPrefix*" }
+foreach ($directory in $directories) {
+    $directoryPath = Join-Path -Path $msvcPath -ChildPath $directory.Name
+    Write-Host "Deleting $directoryPath"
+    Remove-Item -Path $directoryPath -Recurse -Force
+}
+
+[Environment]::SetEnvironmentVariable("BAZEL_VC", "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC", "Machine")
+$env:BAZEL_VC = [Environment]::GetEnvironmentVariable("BAZEL_VC", "Machine")
 
 ## Install Python3
+Write-SerialLog "Installing Python 3 and packages..."
 Write-Host "Installing Python 3..."
-& choco install python3 --params "/InstallDir:C:\python3"
+& choco install python312 --params "/InstallDir:C:\python3"
 $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine")
 New-Item -ItemType SymbolicLink -Path "C:\python3\python3.exe" -Target "C:\python3\python.exe"
 
 ## Install a couple of Python modules required by TensorFlow.
 Write-Host "Updating Python package management tools..."
-& "C:\Python2\python.exe" -m pip install --upgrade pip setuptools wheel
 & "C:\Python3\python.exe" -m pip install --upgrade pip setuptools wheel
 
 Write-Host "Installing Python packages..."
@@ -154,29 +200,13 @@ Write-Host "Installing Python packages..."
     numpy `
     portpicker `
     protobuf `
-    pyreadline `
+    pyreadline3 `
     six `
     requests `
     pyyaml `
     keras_applications `
     keras_preprocessing `
     pywin32
-
-## CMake (for rules_foreign_cc).
-Write-Host "Installing CMake..."
-& choco install cmake
-$env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";C:\Program Files\CMake\bin"
-[Environment]::SetEnvironmentVariable("PATH", $env:PATH, "Machine")
-
-## Ninja 1.8.2 (for rules_foreign_cc).
-Write-Host "Installing Ninja 1.8.2..."
-$ninja_zip = "c:\temp\ninja-win.zip"
-$ninja_root = "c:\ninja"
-(New-Object Net.WebClient).DownloadFile("https://github.com/ninja-build/ninja/releases/download/v1.8.2/ninja-win.zip", $ninja_zip)
-[System.IO.Compression.ZipFile]::ExtractToDirectory($ninja_zip, $ninja_root)
-Remove-Item $ninja_zip
-$env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";${ninja_root}"
-[Environment]::SetEnvironmentVariable("PATH", $env:PATH, "Machine")
 
 ## Get the latest release version number of Bazelisk.
 Write-Host "Grabbing latest Bazelisk version number from GitHub..."
@@ -194,7 +224,8 @@ New-Item "c:\bazel" -ItemType "directory" -Force
 $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";c:\bazel"
 [Environment]::SetEnvironmentVariable("PATH", $env:PATH, "Machine")
 
-## Download the Android NDK and install into C:\android-ndk-r15c.
+## Download the Android NDK r15c and install into C:\android-ndk\r15c.
+Write-Host "Installing Android NDK r15c..."
 $android_ndk_url = "https://dl.google.com/android/repository/android-ndk-r15c-windows-x86_64.zip"
 $android_ndk_zip = "c:\temp\android_ndk.zip"
 $android_ndk_root = "c:\android_ndk"
@@ -202,9 +233,22 @@ New-Item $android_ndk_root -ItemType "directory" -Force
 (New-Object Net.WebClient).DownloadFile($android_ndk_url, $android_ndk_zip)
 [System.IO.Compression.ZipFile]::ExtractToDirectory($android_ndk_zip, $android_ndk_root)
 Rename-Item "${android_ndk_root}\android-ndk-r15c" -NewName "r15c"
+Remove-Item $android_ndk_zip
+
+Write-Host "Installing Android NDK r25b..."
+## Download the Android NDK r25b and install into C:\android-ndk\r25b.
+$android_ndk_url = "https://dl.google.com/android/repository/android-ndk-r25b-windows.zip"
+$android_ndk_zip = "c:\temp\android_ndk.zip"
+$android_ndk_root = "c:\android_ndk"
+New-Item $android_ndk_root -ItemType "directory" -Force
+(New-Object Net.WebClient).DownloadFile($android_ndk_url, $android_ndk_zip)
+[System.IO.Compression.ZipFile]::ExtractToDirectory($android_ndk_zip, $android_ndk_root)
+Rename-Item "${android_ndk_root}\android-ndk-r25b" -NewName "r25b"
+Remove-Item $android_ndk_zip
+
+## Set the ANDROID_NDK_HOME environment variable to r15c.
 [Environment]::SetEnvironmentVariable("ANDROID_NDK_HOME", "${android_ndk_root}\r15c", "Machine")
 $env:ANDROID_NDK_HOME = [Environment]::GetEnvironmentVariable("ANDROID_NDK_HOME", "Machine")
-Remove-Item $android_ndk_zip
 
 ## Download the Android SDK and install into C:\android_sdk.
 $android_sdk_url = "https://dl.google.com/android/repository/commandlinetools-win-7302050_latest.zip"
@@ -228,12 +272,13 @@ Add-Content -Value "`nd975f751698a77b662f1254ddbeed3901e976f5a" -Path "${android
 
 ## Install all required Android SDK components.
 & "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "platform-tools"
-& "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "build-tools;28.0.2"
-& "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "build-tools;30.0.3"
+& "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "build-tools;36.1.0"
 & "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "platforms;android-24"
 & "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "platforms;android-28"
 & "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "platforms;android-29"
 & "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "platforms;android-30"
+& "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "platforms;android-31"
+& "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "platforms;android-32"
 & "${android_sdk_tools_root}\latest\bin\sdkmanager.bat" "extras;android;m2repository"
 
 ## Download and unpack our Git snapshot.
@@ -247,6 +292,7 @@ Expand-Archive -LiteralPath $bazelbuild_zip -DestinationPath $bazelbuild_root -F
 Remove-Item $bazelbuild_zip
 
 ## Download and install the Buildkite agent.
+Write-SerialLog "Installing Buildkite agent and NSSM service..."
 Write-Host "Grabbing latest Buildkite Agent version number from GitHub..."
 $url = "https://github.com/buildkite/agent/releases/latest"
 $req = [system.Net.HttpWebRequest]::Create($url)
@@ -280,6 +326,7 @@ $buildkite_username = "b"
 $buildkite_password = "Bu1ldk1t3"
 $buildkite_secure_password = ConvertTo-SecureString $buildkite_password -AsPlainText -Force
 New-LocalUser -Name $buildkite_username -Password $buildkite_secure_password -UserMayNotChangePassword
+Add-LocalGroupMember -Group "Administrators" -Member $buildkite_username
 Add-NTFSAccess -Path "C:\buildkite" -Account "b" -AccessRights FullControl
 
 ## Allow the Buildkite agent to store SSH host keys in this folder.
@@ -315,6 +362,40 @@ $pagefile.InitialSize = 4 * 1024;
 $pagefile.MaximumSize = 64 * 1024;
 $pagefile.Put();
 
-Write-Host "All done, adding GCESysprep to RunOnce and rebooting..."
-Set-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce" -Name "GCESysprep" -Value "c:\Program Files\Google\Compute Engine\sysprep\gcesysprep.bat"
+### Install security updates
+Write-SerialLog "Installing Windows security updates..."
+# 1. Install the module (if not already present in the base image)
+if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+    Write-Output "Installing PSWindowsUpdate module..."
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers
+    Install-Module -Name PSWindowsUpdate -Force -Scope AllUsers -SkipPublisherCheck
+}
+
+# 2. Import the module
+Import-Module PSWindowsUpdate
+
+# 3. Install only 'Security Updates'
+# -AcceptAll: Auto-accepts EULAs
+# -IgnoreReboot: Prevents the VM from rebooting mid-script
+# -MicrosoftUpdate: Checks against MS servers (useful if WSUS isn't configured)
+Write-Output "Checking for and installing Security Updates..."
+try {
+    $Results = Get-WindowsUpdate -Install -MicrosoftUpdate -Category "Security Updates" -AcceptAll -IgnoreReboot -Verbose -ErrorAction Stop
+    if ($Results) {
+        Write-Output "Updates successfully staged. A reboot is required."
+        $Results | Select-Object -Property KBArticleID, Title, Result
+    } else {
+        Write-Output "No Security Updates found."
+    }
+}
+catch {
+    Write-Error "Update failed: $_"
+}
+
+Write-Host "All done, rebooting..."
+
+Write-SerialLog "Setup windows done, rebooting..."
+
 Restart-Computer
+
+

@@ -20,8 +20,7 @@ rm android-sdk.zip
 yes | tools/bin/sdkmanager --licenses > /dev/null
 tools/bin/sdkmanager --update
 tools/bin/sdkmanager \
-    "build-tools;28.0.2" \
-    "build-tools;30.0.3" \
+    "build-tools;36.1.0" \
     "emulator" \
     "extras;android;m2repository" \
     "platform-tools" \
@@ -29,6 +28,8 @@ tools/bin/sdkmanager \
     "platforms;android-28" \
     "platforms;android-29" \
     "platforms;android-30" \
+    "platforms;android-31" \
+    "platforms;android-32" \
     "system-images;android-19;default;x86" \
     "system-images;android-21;default;x86" \
     "system-images;android-22;default;x86" \

@@ -19,6 +19,7 @@ import json
 import re
 import subprocess
 import threading
+import time
 
 DEBUG = True
 PRINT_LOCK = threading.Lock()
@@ -31,7 +32,7 @@ def debug(*args, **kwargs):
 
 
 def is_sequence(seq):
-    return isinstance(seq, collections.Sequence) and not isinstance(seq, str)
+    return isinstance(seq, collections.abc.Sequence) and not isinstance(seq, str)
 
 
 def gcloud(*args, **kwargs):
@@ -57,9 +58,24 @@ def gcloud(*args, **kwargs):
     if not "get-serial-port-output" in cmd:
         debug("Running: " + " ".join(cmd))
 
-    return subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True
-    )
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            return subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True
+            )
+        except subprocess.CalledProcessError as e:
+            # When multiple threads invoke gcloud concurrently in a fresh environment,
+            # multiple processes race to initialize and migrate gcloud's local SQLite
+            # database (~/.config/gcloud/), causing transient collisions such as:
+            # "ERROR: gcloud crashed (OperationalError): duplicate column name: regional_access_boundary".
+            # Example failure: https://buildkite.com/bazel-trusted/create-linux-vm-image/builds/43#019ff552-6791-4b7a-95c4-2c7c882bcfd5
+            # Retrying allows subsequent attempts to succeed once the initial migration completes.
+            if attempt < max_attempts - 1 and "OperationalError" in e.stderr:
+                debug(f"gcloud crashed with OperationalError on attempt {attempt + 1}, retrying...")
+                time.sleep(1)
+                continue
+            raise
 
 
 def create_instance(name, **kwargs):
@@ -103,6 +119,24 @@ def delete_instance_group(name, **kwargs):
         if not re.search(r"The resource .* was not found", e.stderr):
             raise Exception('"{}" returned unexpected error:\n{}'.format(e.cmd, e.stderr))
         return e
+
+
+def set_instance_template(name, **kwargs):
+    try:
+        return gcloud(
+            "compute", "instance-groups", "managed", "set-instance-template", name, **kwargs
+        )
+    except subprocess.CalledProcessError as e:
+        if not re.search(r"The resource .*/instanceGroupManagers/.* was not found", e.stderr):
+            raise Exception('"{}" returned unexpected error:\n{}'.format(e.cmd, e.stderr))
+        return e
+
+
+def resize_instance_group(name, **kwargs):
+    try:
+        return gcloud("compute", "instance-groups", "managed", "resize", name, **kwargs)
+    except subprocess.CalledProcessError as e:
+        raise Exception('"{}" returned unexpected error:\n{}'.format(e.cmd, e.stderr))
 
 
 def rolling_update_instance_group(name, **kwargs):
@@ -160,6 +194,31 @@ def describe_image_family(name, **kwargs):
             ).stdout
         )
     except subprocess.CalledProcessError as e:
+        raise Exception('"{}" returned unexpected error:\n{}'.format(e.cmd, e.stderr))
+
+
+def create_reservation(name, **kwargs):
+    try:
+        return gcloud("compute", "reservations", "create", name, **kwargs)
+    except subprocess.CalledProcessError as e:
+        raise Exception('"{}" returned unexpected error:\n{}'.format(e.cmd, e.stderr))
+
+
+def update_reservation(name, **kwargs):
+    try:
+        return gcloud("compute", "reservations", "update", name, **kwargs)
+    except subprocess.CalledProcessError as e:
+        raise Exception('"{}" returned unexpected error:\n{}'.format(e.cmd, e.stderr))
+
+
+def describe_reservation(name, **kwargs):
+    try:
+        return json.loads(
+            gcloud("compute", "reservations", "describe", "--format=json", name, **kwargs).stdout
+        )
+    except subprocess.CalledProcessError as e:
+        if re.search(r"The resource .* was not found", e.stderr):
+            return None
         raise Exception('"{}" returned unexpected error:\n{}'.format(e.cmd, e.stderr))
 
 

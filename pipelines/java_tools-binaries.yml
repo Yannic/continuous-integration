@@ -1,6 +1,6 @@
 steps:
   - command: |-
-      bazel --nomaster_bazelrc --bazelrc=/dev/null version
+      bazel --ignore_all_rc_files version
       ./src/upload_all_java_tools.sh
     label: ":ubuntu:"
     agents:
@@ -12,7 +12,7 @@ steps:
           - ANDROID_HOME
           - ANDROID_NDK_HOME
           - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
-        image: gcr.io/bazel-public/centos7-releaser
+        image: gcr.io/bazel-public/rockylinux8-releaser@sha256:2a61b4a50ea72e02764b54ac119b6dd64f96ae513401f71e1bbdff4470335306
         network: host
         privileged: true
         propagate-environment: true
@@ -21,21 +21,58 @@ steps:
         volumes:
           - "/etc/group:/etc/group:ro"
           - "/etc/passwd:/etc/passwd:ro"
-          - "/opt:/opt:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
           - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
           - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
-          - "/var/run/docker.sock:/var/run/docker.sock"
 
-  - command: "powershell -Command \"bazel --nomaster_bazelrc --bazelrc=NUL version ; if (\\$LastExitCode -ne 0) { exit 1 } ; sh ./src/upload_all_java_tools.sh ; if (\\$LastExitCode -ne 0) { exit 1 } ;\""
+  - command: |-
+      bazel --ignore_all_rc_files version
+      ./src/upload_all_java_tools.sh
+    label: "Rocky Linux 8 (arm64)"
+    agents:
+      - "queue=arm64"
+    plugins:
+      docker#v3.8.0:
+        always-pull: true
+        environment:
+          - ANDROID_HOME
+          - ANDROID_NDK_HOME
+          - BUILDKITE_ARTIFACT_UPLOAD_DESTINATION
+        image: gcr.io/bazel-public/rockylinux8-releaser@sha256:671ed89d34afaddb86770a7f0a54c7bb3decf91a8e31bbf1f8e33dd8164419b5
+        network: host
+        privileged: true
+        propagate-environment: true
+        propagate-uid-gid: true
+        shell: ["/bin/bash", "-e", "-c"]
+        volumes:
+          - "/etc/group:/etc/group:ro"
+          - "/etc/passwd:/etc/passwd:ro"
+          - "/etc/shadow:/etc/shadow:ro"
+          - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+          - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
+          - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
+          - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"
+
+  - command: "powershell -Command \"bazel --ignore_all_rc_files version ; if (\\$LastExitCode -ne 0) { exit 1 } ; sh ./src/upload_all_java_tools.sh ; if (\\$LastExitCode -ne 0) { exit 1 } ;\""
     label: ":windows:"
     agents:
       - "queue=windows"
 
   - command: |-
-      bazel --nomaster_bazelrc --bazelrc=/dev/null version
+      bazel --ignore_all_rc_files version
       ./src/upload_all_java_tools.sh
-    env:
-      BAZEL_USE_CPP_ONLY_TOOLCHAIN: "1"
     label: ":darwin:"
     agents:
       - "queue=macos"
+    env:
+      ANDROID_HOME: ""
+      ANDROID_NDK_HOME: ""
+
+  - command: |-
+      bazel --ignore_all_rc_files version
+      ./src/upload_all_java_tools.sh
+    label: ":darwin_arm64:"
+    agents:
+      - "queue=macos_arm64"

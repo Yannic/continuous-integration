@@ -19,177 +19,208 @@
 # pylint: disable=invalid-name
 """The CI script for Bazel Central Registry Postsubmit.
 
-This script does two things:
-  - Mirror new archives detected since last synced BCR commit.
-  - Sync BCR content to bcr.bazel.build.
+This script does one thing:
+  - Sync the bazel_registry.json and modules/ directory in the main branch of the BCR to https://bcr.bazel.build
 """
 
 import base64
 import hashlib
 import json
-import sys
+import os
+import pathlib
+import re
+import requests
 import subprocess
+import sys
 import tempfile
-import urllib.request
 
 BCR_BUCKET = "gs://bcr.bazel.build/"
-LAST_SYNCED_COMMIT_URL = BCR_BUCKET + "last_synced_commit"
-MIRROR_BUCKET = BCR_BUCKET + "test-mirror/"
-MIRROR_URL_PREFIX = "https://bcr.bazel.build/test-mirror/"
+ATTESTATION_METADATA_FILE = "attestations.json"
+FILES_WITH_ATTESTATIONS = ("source.json", "MODULE.bazel")
+
+# Basename of the file that contains the most recent commit
+# that passed through the post-submit pipeline successfully.
+LAST_GREEN_FILE = "last_green.txt"
+
+# Fixed mtime (2020-01-01T00:00:00Z) for all files in modules/ before rsync.
+FIXED_MTIME = 1577836800
 
 
-class BcrPipelineException(Exception):
-    """Raised whenever something goes wrong and we should exit with an error."""
-
-
-def error(msg):
-    raise BcrPipelineException("ERROR: {}".format(msg))
-
-
-def eprint(*args, **kwargs):
-    """
-    Print to stderr and flush (just in case).
-    """
-    print(*args, flush=True, file=sys.stderr, **kwargs)
-
-
-def print_collapsed_group(name):
-    eprint("\n\n--- {0}\n\n".format(name))
-
+class AttestationError(Exception):
+    """Raised when there is a problem wrt attestations."""
 
 def print_expanded_group(name):
-    eprint("\n\n+++ {0}\n\n".format(name))
+    print("\n\n+++ {0}\n\n".format(name))
+
+def get_output(command):
+    return subprocess.run(
+          command,
+          encoding='utf-8',
+          stdout=subprocess.PIPE,
+      ).stdout
+
+def check_and_write_new_attestations():
+    print_expanded_group(":cop::copybara: Check & write attestations")
+    paths = get_new_attestations_json_paths()
+    if not paths:
+        # TODO: turn this into an error
+        print(f"No {ATTESTATION_METADATA_FILE} files were changed.")
+        return
+
+    for p in paths:
+        check_and_write_module_attestations(p)
 
 
-def download(url):
-    with urllib.request.urlopen(url) as response:
-        return response.read()
+def get_new_attestations_json_paths():
+    cwd = os.getcwd()
+    cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-z"]
+
+    # last_green should be the parent commit. However, sometimes the
+    # pipeline can fail due to infra issues. In this case we need
+    # to mirror attestations in the commits of the failing runs, too.
+    last_green = get_last_green()
+    if last_green:
+        cmd.append(last_green)
+
+    paths = get_output(cmd + [get_commit()])
+    result = []
+    attestation_re = re.compile(r"^modules/[^/]+/[^/]+/" + re.escape(ATTESTATION_METADATA_FILE) + r"$")
+    for p in paths.split("\0"):
+        if p and attestation_re.match(p):
+            result.append(os.path.join(cwd, p))
+    return result
 
 
-def fetch_last_synced_commit():
-    print_expanded_group(":gcloud: Fetch last synced commit")
-    commit = subprocess.check_output(
-        ["gsutil", "cat", LAST_SYNCED_COMMIT_URL]
-    ).decode("utf-8").strip()
-    eprint("Last synced commit is " + commit)
-    return commit
+def get_last_green():
+    url = os.path.join(
+        BCR_BUCKET.replace("gs://", "https://storage.googleapis.com/"), LAST_GREEN_FILE
+    )
+    with requests.get(url) as response:
+        if response.status_code != 200:
+            return ""
+
+        return response.content.decode("utf-8")
 
 
-def get_current_commit():
-    print_expanded_group(":git: Get current commit")
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-    eprint("Current commit is " + commit)
-    return commit
+def get_commit():
+    return os.getenv("BUILDKITE_COMMIT")
 
 
-def parse_new_archive_urls(last_synced_commit):
-    # Calcuate changed files since last synced commit
-    print_expanded_group(":git: Parse new archive urls")
-    lines = subprocess.check_output(
-        ["git", "diff", last_synced_commit, "--name-only", "--pretty=format:"]
-    ).decode("utf-8").splitlines()
+def check_and_write_module_attestations(attestations_json_path):
+    print(f"Checking {attestations_json_path}...")
+    dest_dir = os.path.dirname(attestations_json_path)
+    with open(attestations_json_path, "rb") as af:
+        metadata = json.loads(af.read())
+    
+    for f in FILES_WITH_ATTESTATIONS:
+        try:
+            entry = metadata["attestations"][f]
+            check_and_write_single_attestation(entry["url"], entry["integrity"], dest_dir)
+        except Exception as ex:
+            raise AttestationError(f"{attestations_json_path} - {f}: {ex}") from ex
 
-    archive_urls = {}
-    for line in lines:
-        file = line.strip()
-        if file.endswith("source.json"):
-            with open(file) as f:
-                source = json.load(f)
-                archive_urls[source["url"]] = source["integrity"]
-                eprint("New archive found: {0} => {1}\n".format(source["url"], source["integrity"]))
-    return archive_urls
+    print("Done!")
 
+def check_and_write_single_attestation(url, integrity, dest_dir):
+    print(f"\tFound attestation @ {url}")
+    with requests.get(url) as response:
+        if response.status_code != 200:
+            raise AttestationError(f"{url}: HTTP {response.status_code}")
 
-def remove_prefix(line, prefix):
-    if line.startswith(prefix):
-        return line[len(prefix):]
-    return line
+        raw_content = response.content
 
+    check_integrity(raw_content, integrity)
+    print("\t\tIntegrity: OK")
 
-def verify_integrity(data, integrity):
-    algo, expected_value = integrity.split("-", 1)
-    hash_value = ""
-    if algo == "sha256":
-        hash_value = hashlib.sha256(data)
-    elif algo == "sha384":
-        hash_value = hashlib.sha384(data)
-    elif algo == "sha512":
-        hash_value = hashlib.sha512(data)
-    else:
-        error("Wrong integrity value format: " + integrity)
-    return base64.b64encode(hash_value.digest()).decode() == expected_value
+    dest = os.path.join(dest_dir, get_canonical_basename(url))
 
-
-def already_mirrored(target_path):
-    try:
-        subprocess.check_output(["gsutil", "ls", MIRROR_BUCKET + target_path])
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
-
-def mirror_archive(url, integrity):
-    eprint("Trying to mirror {0}, expected integrity {1}".format(url, integrity))
-    if url.startswith("https://"):
-        target_path = remove_prefix(url, "https://")
-    elif url.startswith("http://"):
-        target_path = remove_prefix(url, "http://")
-    else:
-        error("Wrong archive URL: " + url)
-
-    data = download(url)
-
-    if not verify_integrity(data, integrity):
-        error("Integrity value of {0} doesn't match the expected value {1}.".format(url, integrity))
-
-    if already_mirrored(target_path):
-        data = download(MIRROR_URL_PREFIX + target_path)
-        if not verify_integrity(data, integrity):
-            error("Archive URL {0} is already mirrored, but integrity value doesn't match the expected value {1}".format(url, integrity))
-        eprint("{} already exists and integrity value matches, skipping.".format(MIRROR_URL_PREFIX + target_path))
-    else:
-        tmpfile = tempfile.NamedTemporaryFile(delete=False)
-        tmpfile.write(data)
-        tmpfile.close()
-        subprocess.check_output(
-            ["gsutil", "-h", "Cache-Control: public, max-age=31536000", "cp", tmpfile.name, MIRROR_BUCKET + target_path]
+    dest_path = pathlib.Path(dest).resolve()
+    dest_dir_path = pathlib.Path(dest_dir).resolve()
+    if not dest_path.is_relative_to(dest_dir_path):
+        raise AttestationError(
+            f"Resolved path {dest_path} is outside of expected directory {dest_dir_path}"
         )
-        eprint("Mirror succeeded, archive available at {}".format(MIRROR_URL_PREFIX + target_path))
+
+    print(f"\t\tWriting attestation to {dest}...")
+    if os.path.islink(dest):
+        raise AttestationError(f"Symlink found for {dest}")
+    with open(dest, "wb") as f:
+        f.write(raw_content)
+
+def check_integrity(data, expected):
+    algorithm, _, _ = expected.partition("-")
+    assert algorithm in {"sha224", "sha256", "sha384", "sha512"}, "Unsupported SRI algorithm"
+
+    hash = getattr(hashlib, algorithm)(data)
+    encoded = base64.b64encode(hash.digest()).decode()
+    actual = f"{algorithm}-{encoded}"
+    if actual != expected:
+        raise AttestationError(f"Expected checksum {expected}, got {actual}.")
+
+# Attestation files in GitHub releases may have prefixes in their basename
+# to avoid conflicts when multiple modules are released together
+# (e.g. rules_python and rules_python_gazelle_plugin).
+# In this case we need to get the canonical basename.
+def get_canonical_basename(url):
+    actual_basename = os.path.basename(url)
+    for f in FILES_WITH_ATTESTATIONS:
+        if f in actual_basename:
+            return f"{f}.intoto.jsonl"
+    
+    raise AttestationError(f"Invalid basename of {url}.")
+
+
+def pin_mtimes(root):
+    # A fresh git checkout gives every file a new mtime. gcloud storage rsync
+    # stores the mtime in the object metadata and patches it on every object
+    # when it changes, even if the content is the same. Use a fixed mtime so
+    # that only objects with changed content are touched.
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            os.utime(
+                os.path.join(dirpath, name),
+                (FIXED_MTIME, FIXED_MTIME),
+                follow_symlinks=False,
+            )
 
 
 def sync_bcr_content():
     print_expanded_group(":gcloud: Sync BCR content")
     subprocess.check_output(
-        ["gsutil", "-h", "Cache-Control:no-cache", "cp", "./bazel_registry.json", BCR_BUCKET]
+        ["gcloud", "storage", "cp", "--cache-control=no-cache", "./bazel_registry.json", BCR_BUCKET]
     )
+    pin_mtimes("./modules")
     subprocess.check_output(
-        ["gsutil", "-h", "Cache-Control:no-cache", "-m", "rsync", "-d", "-r", "./modules", BCR_BUCKET + "modules"]
+        [
+            "gcloud",
+            "storage",
+            "rsync",
+            "--recursive",
+            # Compare checksums only. The mtime is fixed, so it cannot show changes.
+            "--checksums-only",
+            "--ignore-symlinks",
+            "--cache-control=no-cache",
+            "./modules",
+            BCR_BUCKET + "modules",
+        ]
     )
 
 
-def update_last_synced_commit(current_commit):
-    print_expanded_group(":gcloud: Update last synced commit")
-    subprocess.check_output(
-        "echo %s | gsutil -h 'Cache-Control: no-cache' cp - %s" % (current_commit, LAST_SYNCED_COMMIT_URL),
-        shell=True,
-    )
-    eprint("Last synced commit updated to " + current_commit)
+def update_last_green():
+    path = os.path.join(tempfile.mkdtemp(), LAST_GREEN_FILE)
+    with open(path, "wt") as f:
+        f.write(get_commit())
+
+    dest = os.path.join(BCR_BUCKET, LAST_GREEN_FILE)
+    # get_last_green() reads this file over HTTP, so do not let it be cached.
+    subprocess.check_output(["gcloud", "storage", "cp", "--cache-control=no-cache", path, dest])
 
 
 def main():
-    last_synced_commit = fetch_last_synced_commit()
-    current_commit = get_current_commit()
-    if current_commit == last_synced_commit:
-        eprint("Current commit is already synced.")
-        return 0
-    archive_urls = parse_new_archive_urls(last_synced_commit)
-    print_expanded_group(":gcloud: Mirror archives")
-    for url, integrity in archive_urls.items():
-        mirror_archive(url, integrity)
+    check_and_write_new_attestations()
     sync_bcr_content()
-    update_last_synced_commit(current_commit)
+    update_last_green()
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

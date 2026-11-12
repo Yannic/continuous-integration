@@ -101,8 +101,14 @@ class BuildInfoAnalyzer(threading.Thread):
 
 
     def _get_main_build_result(self):
+        pipeline_info = self.client.get_pipeline_info()
+        if not pipeline_info:
+            error = f"Cannot find pipeline info for pipeline {self.pipeline}."
+            self._log("SERIOUS", error)
+            raise bazelci.BuildkiteException(error)
+
         build_info_list = self.client.get_build_info_list([
-            ("branch", "master"),
+            ("branch", pipeline_info.get("default_branch") or "master"),
             ("page", "1"),
             ("per_page", "1"),
             ("state[]", "failed"),
@@ -117,14 +123,10 @@ class BuildInfoAnalyzer(threading.Thread):
         self.main_result = {}
         self.main_result["commit"] = main_build_info["commit"]
         self.main_result["build_number"] = main_build_info["number"]
-        job_infos = filter(lambda x: bool(x), (extract_job_info_by_key(job) for job in main_build_info["jobs"]))
+        job_infos = filter(lambda x: bool(x), (extract_job_info_by_key(job) for job in main_build_info["jobs"] if not ("soft_failed" in job and job["soft_failed"])))
         self.main_result["tasks"] = group_job_info_by_task(job_infos)
         self.main_result["state"] = get_project_state(self.main_result["tasks"])
-
-        last_green_commit_url = bazelci.bazelci_last_green_commit_url(
-            bazelci.DOWNSTREAM_PROJECTS[self.project]["git_repository"], self.pipeline
-        )
-        self.main_result["last_green_commit"] = bazelci.get_last_green_commit(last_green_commit_url)
+        self.main_result["last_green_commit"] = bazelci.get_last_green_commit(self.project)
 
 
     # Log all succeeded projects in the same annotate block
@@ -189,7 +191,7 @@ class BuildInfoAnalyzer(threading.Thread):
                  bisect_log[pos:].replace("\r", ""),
                  "Bisect URL: " + job["web_url"],
             ]), culprit_commit
-        pos = bisect_log.rfind("Given good commit")  # Matching "Given good commit (XXXX) is not actually good, abort bisecting."
+        pos = bisect_log.rfind("Cannot find a good bazel commit, abort bisecting.")
         if pos != -1:
             self.broken_by_infra = True
             return "\n".join([
@@ -529,10 +531,11 @@ def extract_job_info_by_key(job, info_from_command = [], info_from_job = ["name"
     # Assume there is no space in each argument
     args = job["command"].split(" ")
     for info in info_from_command:
+        prefix = "--" + info + "="
         for arg in args:
-            prefix = "--" + info + "="
             if arg.startswith(prefix):
                 job_info[info] = arg[len(prefix):]
+                break
         if info not in job_info:
             return None
 
@@ -595,23 +598,23 @@ def get_project_state(tasks):
 #     }
 # }
 def get_downstream_result_by_project(downstream_build_info):
-    config_to_project = {}
-    for project_name, project_info in bazelci.DOWNSTREAM_PROJECTS.items():
-        config_to_project[project_info["http_config"]] = project_name
-
     downstream_result = {}
     jobs_per_project = {}
 
     for job in downstream_build_info["jobs"]:
-        job_info = extract_job_info_by_key(job = job, info_from_command = ["http_config", "git_commit"])
+        # Skip all soft failed jobs
+        if "soft_failed" in job and job["soft_failed"]:
+            continue
+        job_info = extract_job_info_by_key(job = job, info_from_command = ["git_commit"])
         if job_info:
-            project_name = config_to_project[job_info["http_config"]]
+            project_name = get_project_name_from_job(job_info)
             if project_name not in downstream_result:
                 jobs_per_project[project_name] = []
-                downstream_result[project_name] = {}
-                downstream_result[project_name]["bazel_commit"] = downstream_build_info["commit"]
-                downstream_result[project_name]["build_number"] = downstream_build_info["number"]
-                downstream_result[project_name]["commit"] = job_info["git_commit"]
+                downstream_result[project_name] = {
+                    "bazel_commit": downstream_build_info["commit"],
+                    "build_number": downstream_build_info["number"],
+                    "commit": job_info["git_commit"],
+                }
             jobs_per_project[project_name].append(job_info)
 
     for project_name in jobs_per_project:
@@ -620,6 +623,12 @@ def get_downstream_result_by_project(downstream_build_info):
         downstream_result[project_name]["state"] = get_project_state(tasks)
 
     return downstream_result
+
+
+def get_project_name_from_job(job_info):
+    # This is a bit of a hack that depends on how bazelci.create_label()
+    # formats job names in downstream pipelines.
+    return job_info.get("name").partition(" (")[0]
 
 
 def main(argv=None):

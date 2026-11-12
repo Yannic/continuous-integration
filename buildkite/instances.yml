@@ -14,37 +14,66 @@
 default_vm:
   boot_disk_size: 500GB
   boot_disk_type: pd-ssd
-  machine_type: c2-standard-30
+  machine_type: c3d-standard-30
   network: default
   region: us-central1
+  zones: us-central1-a,us-central1-b,us-central1-c,us-central1-f
+  target_distribution_shape: ANY
+  # Let the MIG recreate a VM in a different zone when its zone runs out of capacity.
+  on_repair_allow_changing_zone: true
   restart-on-failure: False
   scopes: cloud-platform
-  zone: us-central1-f
   image_project: bazel-public
   tags: health-check
   health_check: buildkite-check
   initial_delay: 60
 instance_groups:
   - name: bk-docker
-    count: 100
+    count: 170
     project: bazel-untrusted
     service_account: buildkite@bazel-untrusted.iam.gserviceaccount.com
     image_family: bk-docker
     metadata_from_file: startup-script=startup-docker-pdssd.sh
   - name: bk-testing-docker
-    count: 30
+    count: 20
     project: bazel-untrusted
     service_account: buildkite-testing@bazel-untrusted.iam.gserviceaccount.com
     image_family: bk-testing-docker
     metadata_from_file: startup-script=startup-docker-pdssd.sh
   - name: bk-trusted-docker
-    count: 8
+    count: 20
     project: bazel-public
     service_account: buildkite-trusted@bazel-public.iam.gserviceaccount.com
     image_family: bk-docker
     metadata_from_file: startup-script=startup-docker-pdssd.sh
+    # Swap template in place so the image pipeline (running on bk-trusted-docker) never deletes its own VM.
+    update_mode: in_place
+  - name: bk-docker-arm64
+    count: 55
+    project: bazel-untrusted
+    service_account: buildkite@bazel-untrusted.iam.gserviceaccount.com
+    image_family: bk-docker-arm64
+    metadata_from_file: startup-script=startup-docker-pdssd.sh
+    machine_type: c4a-standard-8
+    boot_disk_type: hyperdisk-balanced
+  - name: bk-testing-docker-arm64
+    count: 10
+    project: bazel-untrusted
+    service_account: buildkite-testing@bazel-untrusted.iam.gserviceaccount.com
+    image_family: bk-testing-docker-arm64
+    metadata_from_file: startup-script=startup-docker-pdssd.sh
+    machine_type: c4a-standard-8
+    boot_disk_type: hyperdisk-balanced
+  - name: bk-trusted-docker-arm64
+    count: 20
+    project: bazel-public
+    service_account: buildkite-trusted@bazel-public.iam.gserviceaccount.com
+    image_family: bk-docker-arm64
+    metadata_from_file: startup-script=startup-docker-pdssd.sh
+    machine_type: c4a-standard-8
+    boot_disk_type: hyperdisk-balanced
   - name: bk-windows
-    count: 30
+    count: 110
     project: bazel-untrusted
     service_account: buildkite@bazel-untrusted.iam.gserviceaccount.com
     image_family: bk-windows
@@ -56,15 +85,8 @@ instance_groups:
     image_family: bk-testing-windows
     metadata_from_file: windows-startup-script-ps1=startup-windows-pdssd.ps1
   - name: bk-trusted-windows
-    count: 4
+    count: 10
     project: bazel-public
     service_account: buildkite-trusted@bazel-public.iam.gserviceaccount.com
     image_family: bk-windows
     metadata_from_file: windows-startup-script-ps1=startup-windows-pdssd.ps1
-physical_clusters:
-  - name: buildkite-imacpro
-    count: 20
-  - name: bk-testing-macpro
-    count: 4
-  - name: bk-trusted-macpro
-    count: 4

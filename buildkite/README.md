@@ -36,7 +36,7 @@ platforms.
 
 When you click on a pipeline you can see the last few builds of this pipeline. Clicking on a build
 then gives you access to the details of the build. For example, the below image shows a failed build
-step on Ubuntu 16.04.
+step on Ubuntu.
 
 ![failed build step]
 
@@ -81,85 +81,6 @@ for an example.
 
 ![pull request details]
 
-## Presubmit for downstream projects
-
-You can preview the effect of an unmerged commit on downstream projects. See [Testing Local Changes With All Downstream Projects](https://github.com/bazelbuild/continuous-integration/blob/master/docs/downstream-testing.md).
-
-## Checking incompatible changes status for downstream projects
-
-[Bazelisk + Incompatible flags pipeline](https://buildkite.com/bazel/bazelisk-plus-incompatible-flags)
-runs [`bazelisk --migrate`](https://github.com/bazelbuild/bazelisk#other-features) on all downstream projects and reports
-a summary of all incompatible flags and migrations statuses of downstream projects.
-
-The pipeline runs every night against the latest Bazel release. You can also schedule manual builds and set [`USE_BAZEL_VERSION`](https://github.com/bazelbuild/bazelisk#how-does-bazelisk-know-which-version-to-run) to run against a specific release or a release candidate (e.g. `USE_BAZEL_VERSION=0.29rc3` to test against RC3 of release 0.29)
-
-## Culprit Finder
-
-[Bazel downstream projects](https://buildkite.com/bazel/bazel-with-downstream-projects-bazel) is red? Use culprit finder to find out which bazel commit broke it!
-
-First you should check if the project is green with the latest Bazel release. If not, probably it's their commits that broke the CI.
-
-If a project is green with release Bazel but red with Bazel nightly, it means some Bazel commit broke it, then culprit finder can help!
-
-Create "New Build" in the [Culprit Finder](https://buildkite.com/bazel/culprit-finder) project with the following environment variable:
-
-- **PROJECT_NAME** (The project name must exist in DOWNSTREAM_PROJECTS in [bazelci.py](https://github.com/bazelbuild/continuous-integration/blob/master/buildkite/bazelci.py))
-- (Optional) **TASK_NAME** (The task name must exist in the project's config file, eg. [macos_latest](https://github.com/bazelbuild/rules_apple/blob/master/.bazelci/presubmit.yml#L3)). For old config syntax where platform name is essentially the task name, you can also set PLATFORM_NAME instead of TASK_NAME. If not set, culprit finder will bisect for all tasks of the specified project.
-- (Optional) **TASK_NAME_LIST** A list of **TASK_NAME** separated by `,`. You can set this to bisect for multiple tasks in one build. It will be ignored if **TASK_NAME** is set.
-- (Optional) **GOOD_BAZEL_COMMIT** (A full Bazel commit, Bazel built at this commit still works for this project). If not set, culprit finder will use the last green bazel commit in downstream pipeline as the good bazel commit.
-- (Optional) **BAD_BAZEL_COMMIT** (A full Bazel commit, Bazel built at this commit fails with this project). If not set, culprit finder will use the lastest Bazel commit as the bad bazel commit.
-- (Optional) **NEEDS_CLEAN** (Set **NEEDS_CLEAN** to `true` to run `bazel clean --expunge` before each build, this will help reduce flakiness)
-- (Optional) **REPEAT_TIMES** (Set **REPEAT_TIMES** to run the build multiple times to detect flaky build failure, if at least one build fails we consider the commit as bad)
-
-
-eg.
-```
-PROJECT_NAME=rules_go
-PLATFORM_NAME=ubuntu2004
-GOOD_BAZEL_COMMIT=b6ea3b6caa7f379778e74da33d1bd0ff6477f963
-BAD_BAZEL_COMMIT=91eb3d207714af0ab1e5812252a0f10f40d6e4a8
-```
-
-Note: Bazel commit can only be set to commits after [63453bdbc6b05bd201375ee9e25b35010ae88aab](https://github.com/bazelbuild/bazel/commit/63453bdbc6b05bd201375ee9e25b35010ae88aab), Culprit Finder needs to download Bazel at specific commit, but we didn't prebuild Bazel binaries before this commit.
-
-## Bazel Auto Sheriff
-
-[Bazel Auto Sheriff](https://buildkite.com/bazel/bazel-auto-sheriff-face-with-cowboy-hat) is the pipeline to monitor Bazel CI build status and identify reasons for breakages.
-
-Based on a project's build result in main build (with Bazel@Release) and downstream build (with Bazel@HEAD), the Bazel Auto Sheriff does analyzing by the following principles:
-
-* Main Build: PASSED, Downstream build: PASSED
-
-  Everything is fine.
-
-- Main Build: FAILED, Downstream build: PASSED
-
-  Retry the failed jobs to check if they are flaky
-  - If passed, report the failed tasks as flaky.
-  - If failed, the project is probably broken by its own change.
-
-- Main Build: PASSED, Downstream build: FAILED
-
-  Retry the failed downstream jobs to check if they are flaky
-
-  - If passed, report the failed tasks as flaky.
-  - If failed, use culprit finder to do a bisect for each failed project to detect the culprit.
-
-- Main Build: FAILED, Downstream build: FAILED
-
-  Rebuild the project at last green commit
-
-  - If failed, the build is likely broken by an infrastructure change.
-  - If passed, analyze main build and downstream build separately according to the same principles as above.
-
-After the analysis, the pipeline will give a summary of four kinds of breakages:
-- Breakages caused by infra change.
-- Breakages caused by Bazel change, including the culprits identified.
-- Breakages caused by the project itself.
-- Flaky builds.
-
-You can check the analysis log for more details.
-
 ## Configuring a Pipeline
 
 Each pipeline is configured via a Yaml file. This file either lives in `$PROJECT_DIR/.bazelci/presubmit.yml` (for presubmits) or in an arbitrary location whose path or URL is passed to the CI script (as configured in the Buildkite settings of the respective pipeline). Projects should store the postsubmit configuration in their own repository, but we keep some configurations for downstream projects in https://github.com/bazelbuild/continuous-integration/tree/master/buildkite/pipelines.
@@ -172,7 +93,7 @@ The most important piece of the configuration file is the `tasks` dictionary. Ea
 ---
 tasks:
   ubuntu_build_only:
-    platform: ubuntu2004
+    platform: ubuntu2404
     build_targets:
     - "..."
   windows:
@@ -188,7 +109,7 @@ If there is exactly one task per platform, you can omit the `platform` field and
 ```yaml
 ---
 tasks:
-  ubuntu2004:
+  ubuntu2404:
     build_targets:
     - "..."
   windows:
@@ -198,6 +119,8 @@ tasks:
     - "..."
 ```
 
+The full list of supported platforms can be found in the PLATFORMS variable in [bazelci.py](https://github.com/bazelbuild/continuous-integration/blob/master/buildkite/bazelci.py).
+
 ### Setting Environment Variables
 
 You can set environment variables for each individual task via the `environment` field:
@@ -205,7 +128,7 @@ You can set environment variables for each individual task via the `environment`
 ```yaml
 ---
 tasks:
-  ubuntu1804:
+  ubuntu2404:
     environment:
       CC: clang
     build_targets:
@@ -223,7 +146,7 @@ The following example demonstrates all of these features:
 ```yaml
 ---
 tasks:
-  ubuntu1804:
+  ubuntu2404:
     shell_commands:
     - rm -f obsolete_file
     run_targets:
@@ -237,6 +160,18 @@ tasks:
     - "..."
 ```
 
+### Running Bazel coverage
+
+The `coverage_targets` field allows you to specify a list of targets that will be run using `bazel coverage`:
+
+```yaml
+---
+tasks:
+  ubuntu2404:
+    coverage_targets:
+    - "..."
+```
+
 ### Using Specific Build & Test Flags
 
 The `build_flags` and `test_flags` fields contain lists of flags that should be used when building or testing (respectively):
@@ -244,7 +179,7 @@ The `build_flags` and `test_flags` fields contain lists of flags that should be 
 ```yaml
 ---
 tasks:
-  ubuntu1804:
+  ubuntu2404:
     build_flags:
     - "--define=ij_product=clion-latest"
     build_targets:
@@ -254,6 +189,42 @@ tasks:
     test_targets:
     - ":clwb_tests"
 ```
+
+### Sharing Configuration Between Tasks
+
+You can define common configurations and share them between tasks using `*aliases` and the [`<<:` merge key](https://yaml.org/type/merge.html). YAML allows merging maps and sets, but not lists; to merge flags or targets, instead of a list, represent them as a map from strings to null:
+
+```yaml
+# This is a map from strings to null, not a list, to allow merging into windows.build_flags and windows.test_flags
+.common_flags: &common_flags
+  ? "--incompatible_disable_starlark_host_transitions"
+  ? "--enable_bzlmod"
+
+.common_task_config: &common_task_config
+  build_flags: *common_flags
+  build_targets:
+    - "//..."
+  test_flags: *common_flags
+  test_targets:
+    - "//tests/..."
+
+tasks:
+  ubuntu2404:
+    <<: *common_task_config
+  ubuntu2204:
+    <<: *common_task_config
+  windows:
+    <<: *common_task_config
+    # These are maps from strings to null, not lists, to allow merging
+    build_flags:
+      <<: *common_flags
+      ? "--noexperimental_repository_cache_hardlinks"
+    test_flags:
+      <<: *common_flags
+      ? "--noexperimental_repository_cache_hardlinks"
+```
+
+Instead of a map from string to null, you could use a set (via `!!set`); however, sets are unordered, which makes them unsuitable for target lists that use the negation operator.
 
 ### Specifying a Display Name
 
@@ -271,7 +242,7 @@ tasks:
 
 ### Generating semantic information with Kythe
 
-You can use `kythe_ubuntu2004` platform along with some `index_*` fields to create a task that generate semantic information of your code with [Kythe](https://kythe.io/).
+You can use `kythe_ubuntu2404` platform along with some `index_*` fields to create a task that generate semantic information of your code with [Kythe](https://kythe.io/).
 
 The `index_targets` field contains list of targets that should be indexed.
 
@@ -289,7 +260,7 @@ If `index_upload_gcs` is `True`, the generated files will be uploaded to Google 
 ```yaml
 ---
 tasks:
-  kythe_ubuntu2004:
+  kythe_ubuntu2404:
     index_targets:
     - "..."
     index_targets_query: "kind(\"java_(binary|import|library|plugin|test|proto_library) rule\", ...)"
@@ -306,7 +277,7 @@ Most existing configuration use the legacy format with a "platforms" dictionary:
 ```yaml
 ---
 platforms:
-  ubuntu1804:
+  ubuntu2404:
     build_targets:
     - "..."
     test_targets:
@@ -319,7 +290,7 @@ The new format expects a "tasks" dictionary instead:
 ---
 tasks:
   arbitrary_id:
-    platform: ubuntu1804
+    platform: ubuntu2404
     build_targets:
     - "..."
     test_targets:
@@ -331,7 +302,7 @@ In this case we can omit the `platform` field since there is a 1:1 mapping betwe
 ```yaml
 ---
 tasks:
-  ubuntu1804:
+  ubuntu2404:
     build_targets:
     - "..."
     test_targets:
@@ -354,7 +325,7 @@ tasks:
   macos:
     build_targets:
     - "..."
-  ubuntu1804:
+  ubuntu2404:
     bazel: 0.18.0
     build_targets:
     - "..."
@@ -450,6 +421,20 @@ buildifier:
 [...]
 ```
 
+### Check .mdx documentation files with Mintlify
+
+If your pipeline clones the Bazel repository, you can enable the documentation
+validation check by setting the global `check_docs` field.
+
+As a result, all your builds will contain an additional step that validates the
+.mdx files via [Mintlify](https://www.mintlify.com/docs/installation#validate-documentation-build):
+
+```yaml
+---
+check_docs: 1
+[...]
+```
+
 ### Using multiple Workspaces in a single Pipeline
 
 Some projects may contain one or more `WORKSPACE` files in subdirectories, in addition to their top-level `WORKSPACE` file.
@@ -461,12 +446,12 @@ Consider the configuration for a project that contains a second `WORKSPACE` file
 tasks:
   production_code:
     name: "My Project"
-    platform: ubuntu1804
+    platform: ubuntu2404
     test_targets:
     - //...
   examples:
     name: Examples
-    platform: ubuntu1804
+    platform: ubuntu2404
     working_directory: examples_dir
     test_targets:
     - //...
@@ -497,7 +482,7 @@ Example usage:
 ```yaml
 ---
 tasks:
-  ubuntu2004:
+  ubuntu2404:
     include_json_profile:
     - build
     - test
@@ -510,6 +495,130 @@ tasks:
 When `include_json_profile` is specified with `build`, the builds will be carried out with the extra JSON profile flags. Similarly for `test`. Other values will be ignored.
 
 The exported JSON profiles are available as artifacts after each run.
+
+### Matrix Testing
+
+Similar to Github Actions's [matrix testing support](https://docs.github.com/en/actions/learn-github-actions/workflow-syntax-for-github-actions#jobsjob_idstrategymatrix), you can specify a matrix to create multiple tasks by performing variable substitution in a single task configuration.
+
+Example usage:
+
+```yaml
+---
+matrix:
+  bazel_version: ["4.2.2", "5.0.0"]
+  unix_platform: ["rockylinux8", "debian13", "macos", "ubuntu2404"]
+  python: ["python2", "python3"]
+  unix_compiler: ["gcc", "clang"]
+  win_compiler: ["msvc", "clang"]
+
+tasks:
+  unix_test:
+    name: "Test my project on Unix systems with {python}"
+    platform: ${{ unix_platform }}
+    compiler: ${{ unix_compiler }}
+    python: ${{ python }}
+    build_targets:
+    - "//..."
+    test_targets:
+    - "//..."
+  windows_test:
+    name: "Test my project on Windows with {python}"
+    platform: "windows"
+    bazel: ${{ bazel_version }}
+    compiler: ${{ win_compiler }}
+    python: ${{ python }}
+    build_targets:
+    - "//..."
+    test_targets:
+    - "//..."
+```
+
+The `unix_test` task configuration will generate 16 tasks (4 * 2 * 2) for each `unix_platform`, `unix_compiler`, and `python` combination.
+
+The `windows_test` task configuration will generate 8 tasks (2 * 2 * 2) for each `bazel_version`, `win_compiler` and `python` combination.
+
+The names of the jobs will also have the python version in them; note that the name field uses `{key}` while other
+fields use `${{ key }}`.
+
+Matrix values can also use friendly aliases that hold more complex types, like
+
+```yaml
+---
+matrix:
+  bzlmod:
+    enabled: ["--enable_bzlmod", "--noenable_workspace"]
+    disabled: ["--noenable_bzlmod", "--enable_workspace"]
+
+tasks:
+  test:
+    name: "Test with bzlmod {bzlmod}"
+    build_flags: ${{ bzlmod }}
+```
+
+The names of these jobs will use the alias, as in `Test with bzlmod enabled` and `Test with bzlmod disabled`, but the
+build flags will use the list value.
+
+Matrix values can also be flattened into lists, like:
+```yaml
+---
+matrix:
+  bzlmod:
+    enabled: ["--enable_bzlmod", "--noenable_workspace"]
+    disabled: ["--noenable_bzlmod", "--enable_workspace"]
+
+tasks:
+  test:
+    name: "Test with bzlmod {bzlmod}"
+    build_flags:
+      - --fixed_flag
+      - ${{ bzlmod }}
+```
+
+The list inside `bzlmod.enabled` will be flattened into the build flags list, resulting in
+`["--fixed_flag", "--enable_bzlmod", "--noenable_workspace"]`.
+
+#### Excluding specific combinations
+
+You can exclude specific matrix combinations using the `exclude` key inside the `matrix` section:
+
+```yaml
+---
+matrix:
+  platform: ["ubuntu2404", "macos", "windows"]
+  compiler: ["gcc", "clang"]
+  exclude:
+    - platform: "windows"
+      compiler: "gcc"   # GCC is not supported on Windows
+
+tasks:
+  build:
+    name: "Build on {platform} with {compiler}"
+    platform: ${{ platform }}
+    compiler: ${{ compiler }}
+    build_targets:
+    - "//..."
+```
+
+In this example, 5 tasks will be generated (3 platforms × 2 compilers = 6 combinations, minus 1 excluded).
+
+Each item in the `exclude` list is a dictionary that specifies attribute values. A combination is excluded if it matches **all** attributes in any exclusion rule. You can also specify partial exclusions (e.g., exclude all combinations with a specific platform) by only specifying a subset of attributes.
+
+For values that use aliases, the aliases are used for the exclude field, as in:
+
+```yaml
+matrix:
+  bzlmod:
+    enabled: --enable_bzlmod --noenable_workspace
+    disabled: --noenable_bzlmod --enable_workspace
+  bazel: ["9.x", "7.x"]
+  exclude:
+    - bazel: "9.x"
+      bzlmod: "disabled"
+```
+
+## Downstream testing
+
+For existing projects on Bazel CI, you can add your project to [Bazel's downstream testing pipeline](https://github.com/bazelbuild/continuous-integration/blob/master/docs/downstream-testing.md) to catch breakages from Bazel@HEAD as soon as possible.
 
 ## FAQ
 

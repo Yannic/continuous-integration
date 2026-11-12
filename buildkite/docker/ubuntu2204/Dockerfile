@@ -1,0 +1,119 @@
+FROM ubuntu:22.04 AS ubuntu2204-bazel-nojdk
+ARG TARGETARCH
+
+ENV DEBIAN_FRONTEND="noninteractive"
+ENV LANG "C.UTF-8"
+ENV LANGUAGE "C.UTF-8"
+ENV LC_ALL "C.UTF-8"
+
+### Install packages required by Bazel and its tests
+RUN apt-get -y update && \
+    apt-get -y install --no-install-recommends \
+    apt-utils \
+    bind9-host \
+    build-essential \
+    clang \
+    clang-tools \
+    coreutils \
+    curl \
+    dnsutils \
+    ed \
+    expect \
+    file \
+    git \
+    gnupg2 \
+    iproute2 \
+    iputils-ping \
+    lcov \
+    less \
+    libc++-dev \
+    libncurses5 \
+    libssl-dev \
+    llvm \
+    llvm-dev \
+    lsb-release \
+    locales \
+    netcat-openbsd \
+    openssh-client \
+    python-is-python3 \
+    python2 \
+    python2-dev \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-requests \
+    python3-setuptools \
+    python3-six \
+    python3-wheel \
+    python3-yaml \
+    software-properties-common \
+    sudo \
+    unzip \
+    vim \
+    wget \
+    zip \
+    zlib1g-dev \
+    && \
+    apt-get -y purge apport && \
+    rm -rf /var/lib/apt/lists/*
+
+# Allow using sudo inside the container.
+RUN echo "ALL ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# Ensure that Bazel can use its beloved ISO-8859-1 locale.
+RUN localedef -i en_US -f ISO-8859-1 en_US.ISO-8859-1
+
+FROM ubuntu2204-bazel-nojdk AS ubuntu2204-nojdk
+
+### Install Google Cloud CLI.
+### https://cloud.google.com/sdk/docs/quickstart-debian-ubuntu
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - && \
+    apt-get update -y && apt-get install google-cloud-cli -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# Bazelisk
+COPY --from=tools --chmod=0755 bazelisk-linux-${TARGETARCH} /usr/local/bin/bazel
+
+# Buildifier
+COPY --from=tools --chmod=0755 buildifier-linux-${TARGETARCH} /usr/local/bin/buildifier
+
+FROM ubuntu2204-bazel-nojdk AS ubuntu2204-bazel-java17
+
+RUN apt-get -y update && \
+    apt-get -y install openjdk-17-jdk-headless && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME /usr/lib/jvm/java-17-openjdk-${TARGETARCH}
+
+FROM ubuntu2204-nojdk AS ubuntu2204-java17
+
+RUN apt-get -y update && \
+    apt-get -y install openjdk-17-jdk-headless && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME /usr/lib/jvm/java-17-openjdk-${TARGETARCH}
+
+FROM ubuntu2204-nojdk AS ubuntu2204
+
+RUN apt-get -y update && \
+    apt-get -y install openjdk-21-jdk-headless && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME /usr/lib/jvm/java-21-openjdk-${TARGETARCH}
+
+FROM ubuntu2204 AS ubuntu2204-kythe
+
+# kythe 0.0.67 requires GLIBCXX_3.4.32 which isn't available on ubuntu 22.04 by default.
+# Using a test toolchain
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test && \
+    apt-get -y update && \
+    apt-get -y install --only-upgrade libstdc++6 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN LATEST_KYTHE=v0.0.68 && \
+    mkdir /usr/local/kythe && \
+    curl -fsSL https://github.com/kythe/kythe/releases/download/${LATEST_KYTHE}/kythe-{$LATEST_KYTHE}.tar.gz | \
+    tar xvz --no-same-owner --strip-components 1 --directory /usr/local/kythe && \
+    chmod -R a+rw /usr/local/kythe && \
+    test -f /usr/local/kythe/WORKSPACE

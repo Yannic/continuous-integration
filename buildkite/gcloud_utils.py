@@ -21,7 +21,7 @@ import time
 import re
 
 
-def wait_for_instance(instance_name, project, zone, status):
+def wait_for_instance(instance_name, project, zone, status, deadline=None):
     while True:
         result = gcloud.describe_instance(instance_name, project=project, zone=zone, format="json")
         current_status = json.loads(result.stdout)["status"]
@@ -36,6 +36,10 @@ def wait_for_instance(instance_name, project, zone, status):
                     zone, instance_name, current_status, status
                 )
             )
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {zone}/{instance_name} to reach status {status} (current: {current_status})"
+            )
         time.sleep(5)
 
 
@@ -49,12 +53,12 @@ def prettify_logs(instance_name, log, with_prefix=True):
         # Then drop the common prefix to make the output easier to read.
         # For unknown platforms, we just take every line unmodified.
         if "ubuntu" in instance_name or "docker" in instance_name:
-            match = re.match(r".*GCEMetadataScripts: startup-script: (.*)", line)
+            match = re.match(r".*: startup-script: (.*)", line)
             if not match:
                 continue
             line = match.group(1)
         elif "windows" in instance_name:
-            match = re.match(r".*windows-startup-script-ps1: (.*)", line)
+            match = re.match(r".*\[setup-windows.ps1\]: (.*)", line)
             if not match:
                 continue
             line = match.group(1)
@@ -72,7 +76,7 @@ def print_pretty_logs(instance_name, log):
             print(lines)
 
 
-def tail_serial_console(instance_name, project, zone, start=None, until=None):
+def tail_serial_console(instance_name, project, zone, start=None, until=None, deadline=None):
     next_start = start if start else "0"
     while True:
         try:
@@ -82,6 +86,10 @@ def tail_serial_console(instance_name, project, zone, start=None, until=None):
         except subprocess.CalledProcessError as e:
             if "Could not fetch serial port output: TIMEOUT" in e.stderr:
                 gcloud.debug("tail_serial_console: Retrying after TIMEOUT")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out tailing serial console of {zone}/{instance_name}"
+                    ) from e
                 continue
             gcloud.debug("tail_serial_console: Done, because got exception: {}".format(e))
             if e.stdout:
@@ -94,5 +102,7 @@ def tail_serial_console(instance_name, project, zone, start=None, until=None):
         if until and until in result.stdout:
             gcloud.debug('tail_serial_console: Done, because found string "{}"'.format(until))
             break
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out tailing serial console of {zone}/{instance_name}")
         time.sleep(5)
     return next_start

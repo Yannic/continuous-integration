@@ -15,55 +15,62 @@
 # limitations under the License.
 
 from datetime import datetime
-import json
 import os
-import queue
-import subprocess
 import sys
 import tempfile
-import threading
+import time
 
 import gcloud
 import gcloud_utils
 
 DEBUG = False
+DEFAULT_MACHINE_TYPE = "c3d-standard-8"
+DEFAULT_BOOT_DISK_TYPE = "pd-ssd"
+SETUP_TIMEOUT_SECONDS = 2 * 60 * 60
 
 IMAGE_CREATION_VMS = {
     "bk-testing-docker": {
         "project": "bazel-public",
         "zone": "us-central1-f",
         "source_image_project": "ubuntu-os-cloud",
-        "source_image_family": "ubuntu-2004-lts",
+        "source_image_family": "ubuntu-2204-lts",
         "setup_script": "setup-docker.sh",
-        "guest_os_features": ["VIRTIO_SCSI_MULTIQUEUE"],
+        "guest_os_features": ["VIRTIO_SCSI_MULTIQUEUE", "GVNIC"],
         "licenses": [
             "https://www.googleapis.com/compute/v1/projects/vm-options/global/licenses/enable-vmx"
         ],
+    },
+    "bk-testing-docker-arm64": {
+        "project": "bazel-public",
+        "zone": "us-central1-f",
+        "source_image_project": "ubuntu-os-cloud",
+        "source_image_family": "ubuntu-2204-lts-arm64",
+        "setup_script": "setup-docker.sh",
+        "guest_os_features": ["VIRTIO_SCSI_MULTIQUEUE", "GVNIC"],
+        "licenses": [
+            "https://www.googleapis.com/compute/v1/projects/vm-options/global/licenses/enable-vmx"
+        ],
+        "machine_type": "c4a-standard-8",
+        "boot_disk_type": "hyperdisk-balanced",
     },
     "bk-testing-windows": {
         "project": "bazel-public",
         "zone": "us-central1-f",
         "source_image_project": "windows-cloud",
-        "source_image_family": "windows-20h2-core",
+        "source_image_family": "windows-2022", # vs build tools failed to install on windows-2022-core
         "setup_script": "setup-windows.ps1",
-        "guest_os_features": ["VIRTIO_SCSI_MULTIQUEUE"],
+        "guest_os_features": ["VIRTIO_SCSI_MULTIQUEUE", "GVNIC"],
     },
     "windows-playground": {
         "project": "di-cloud-exp",
         "zone": "us-central1-f",
         "network": "default",
         "source_image_project": "windows-cloud",
-        "source_image_family": "windows-2019",
+        "source_image_family": "windows-2022",
         "setup_script": "setup-windows.ps1",
-        "guest_os_features": ["VIRTIO_SCSI_MULTIQUEUE"],
+        "guest_os_features": ["VIRTIO_SCSI_MULTIQUEUE", "GVNIC"],
     },
 }
-
-WORK_QUEUE = queue.Queue()
-
-
-def run(args, **kwargs):
-    return subprocess.run(args, **kwargs)
 
 
 def preprocess_setup_script(setup_script, is_windows):
@@ -77,6 +84,8 @@ def preprocess_setup_script(setup_script, is_windows):
             if is_windows:
                 f.write("'@\n")
                 f.write('[System.IO.File]::WriteAllLines("c:\\setup.ps1", $setup_script)\n')
+                f.write("$ts = Get-Date -Format 'yyyyMMdd-HHmmss'\n")
+                f.write('Start-Process -FilePath "powershell.exe" -ArgumentList "-File c:\\setup.ps1" -RedirectStandardOutput "c:\\setup-stdout-$ts.log" -RedirectStandardError "c:\\setup-stderr-$ts.log" -NoNewWindow\n')
     return output_file
 
 
@@ -101,10 +110,10 @@ def create_instance(instance_name, params):
             instance_name,
             project=params["project"],
             zone=params["zone"],
-            machine_type="c2-standard-8",
+            machine_type=params.get("machine_type", DEFAULT_MACHINE_TYPE),
             network=params.get("network", "default"),
             metadata_from_file=startup_script,
-            boot_disk_type="pd-ssd",
+            boot_disk_type=params.get("boot_disk_type", DEFAULT_BOOT_DISK_TYPE),
             boot_disk_size=params.get("boot_disk_size", "500GB"),
             **image,
         )
@@ -112,50 +121,24 @@ def create_instance(instance_name, params):
         os.remove(setup_script)
 
 
-# https://stackoverflow.com/a/25802742
-def write_to_clipboard(output):
-    process = subprocess.Popen("pbcopy", env={"LANG": "en_US.UTF-8"}, stdin=subprocess.PIPE)
-    process.communicate(output.encode("utf-8"))
-
-
-def print_windows_instructions(project, zone, instance_name):
-    tail_start = gcloud_utils.tail_serial_console(
-        instance_name, project=project, zone=zone, until="Finished running startup scripts"
-    )
-
-    pw = json.loads(
-        gcloud.reset_windows_password(
-            instance_name, format="json", project=project, zone=zone
-        ).stdout
-    )
-    rdp_file = tempfile.mkstemp(suffix=".rdp")[1]
-    with open(rdp_file, "w") as f:
-        f.write("full address:s:" + pw["ip_address"] + "\n")
-        f.write("username:s:" + pw["username"] + "\n")
-    subprocess.run(["open", rdp_file])
-    write_to_clipboard(pw["password"])
-    with gcloud.PRINT_LOCK:
-        print("Use this password to connect to the Windows VM: " + pw["password"])
-        print("Please run the setup script C:\\setup.ps1 once you're logged in.")
-
-    # Wait until the VM reboots once, then open RDP again.
-    tail_start = gcloud_utils.tail_serial_console(
-        instance_name,
-        project=project,
-        zone=zone,
-        start=tail_start,
-        until="GCEGuestAgent: GCE Agent Started",
-    )
-    print("Connecting via RDP a second time to finish the setup...")
-    write_to_clipboard(pw["password"])
-    run(["open", rdp_file])
-    return tail_start
-
-
 def workflow(name, params):
     instance_name = "%s-image-%s" % (name, int(datetime.now().timestamp()))
     project = params["project"]
     zone = params["zone"]
+
+    leftover_vms = gcloud.gcloud(
+        "compute",
+        "instances",
+        "list",
+        project=project,
+        zones=zone,
+        filter=f"name ~ ^{name}-image-",
+        format="value(name)",
+    ).stdout.splitlines()
+    for vm in leftover_vms:
+        print(f"Deleting leftover image VM {vm} from a previous run")
+        gcloud.delete_instance(vm, project=project, zone=zone, **{"async": True})
+
     try:
         # Create the VM.
         create_instance(instance_name, params)
@@ -163,21 +146,22 @@ def workflow(name, params):
         # Wait for the VM to become ready.
         gcloud_utils.wait_for_instance(instance_name, project=project, zone=zone, status="RUNNING")
 
-        if "windows" in instance_name:
-            # Wait for VM to be ready, then print setup instructions.
-            tail_start = print_windows_instructions(project, zone, instance_name)
-            # Continue printing the serial console until the VM shuts down.
+        deadline = time.monotonic() + SETUP_TIMEOUT_SECONDS
+        try:
+            # Continuously print the serial console (blocks until the VM shuts down or errors).
             gcloud_utils.tail_serial_console(
-                instance_name, project=project, zone=zone, start=tail_start
+                instance_name, project=project, zone=zone, deadline=deadline
             )
-        else:
-            # Continuously print the serial console.
-            gcloud_utils.tail_serial_console(instance_name, project=project, zone=zone)
 
-        # Wait for the VM to completely shutdown.
-        gcloud_utils.wait_for_instance(
-            instance_name, project=project, zone=zone, status="TERMINATED"
-        )
+            # Wait for the VM to completely shutdown.
+            gcloud_utils.wait_for_instance(
+                instance_name, project=project, zone=zone, status="TERMINATED", deadline=deadline
+            )
+        except TimeoutError as e:
+            raise TimeoutError(
+                "Setup did not finish within 2h (last progress line is in the log above); "
+                "the VM was deleted."
+            ) from e
 
         # Create a new image from our VM.
         gcloud.create_image(
@@ -193,17 +177,6 @@ def workflow(name, params):
         gcloud.delete_instance(instance_name, project=project, zone=zone)
 
 
-def worker():
-    while True:
-        item = WORK_QUEUE.get()
-        if not item:
-            break
-        try:
-            workflow(**item)
-        finally:
-            WORK_QUEUE.task_done()
-
-
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -212,7 +185,10 @@ def main(argv=None):
         print("Usage: create_images.py {}".format(" ".join(IMAGE_CREATION_VMS.keys())))
         return 1
 
-    unknown_args = set(argv).difference(IMAGE_CREATION_VMS.keys())
+    # Handle multiple args as well as a single-arg comma-delimited list.
+    names = argv if len(argv) > 1 else argv[0].split(",")
+
+    unknown_args = set(names).difference(IMAGE_CREATION_VMS.keys())
     if unknown_args:
         print(
             "Unknown platforms: {}\nAvailable platforms: {}".format(
@@ -221,27 +197,8 @@ def main(argv=None):
         )
         return 1
 
-    # Put VM creation instructions into the work queue.
-    for name in argv:
-        WORK_QUEUE.put({"name": name, "params": IMAGE_CREATION_VMS[name]})
-
-    # Spawn worker threads that will create the VMs.
-    threads = []
-    for _ in range(WORK_QUEUE.qsize()):
-        t = threading.Thread(target=worker)
-        t.start()
-        threads.append(t)
-
-    # Wait for all VMs to be created.
-    WORK_QUEUE.join()
-
-    # Signal worker threads to exit.
-    for _ in range(len(threads)):
-        WORK_QUEUE.put(None)
-
-    # Wait for worker threads to exit.
-    for t in threads:
-        t.join()
+    for n in names:
+        workflow(n, IMAGE_CREATION_VMS[n])
 
     return 0
 

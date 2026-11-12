@@ -1,58 +1,43 @@
 ---
 platforms:
-  ubuntu1804:
+  ubuntu2404:
     environment:
       TF_IGNORE_MAX_BAZEL_VERSION: 1
-      USE_BAZEL_VERSION: latest
     shell_commands:
-    # - |-
-    #   echo '
-    #   import %workspace%/.bazelrc' >>bazel.bazelrc
-    # - |-
-    #   echo '
-    #   android_sdk_repository(name = "androidsdk")
-    #   android_ndk_repository(name = "androidndk")' >>WORKSPACE
-    - pip3 install portpicker keras_applications keras_preprocessing future
+    - pip3 install portpicker keras_applications keras_preprocessing future packaging dataclasses
+    - wget https://apt.llvm.org/llvm.sh && sudo bash llvm.sh 16
     - yes '' | python3 ./configure.py
     build_flags:
-    - "--config=opt"
     # Suppress warning messages from all actions
     - "--output_filter=^$"
+    - "--host_features=-force_no_whole_archive"
     build_targets:
     - "//tensorflow/tools/pip_package:build_pip_package"
-    # - "//tensorflow/examples/android:tensorflow_demo"
   macos:
     environment:
       TF_IGNORE_MAX_BAZEL_VERSION: 1
-      USE_BAZEL_VERSION: latest
     shell_commands:
-    # - |-
-    #   echo '
-    #   import %workspace%/.bazelrc' >>bazel.bazelrc
-    # - |-
-    #   echo '
-    #   android_sdk_repository(name = "androidsdk")
-    #   android_ndk_repository(name = "androidndk")' >>WORKSPACE
-    - pip3 install -U --user pip six 'numpy<1.19.0' wheel setuptools mock 'future>=0.17.1' portpicker
-    - pip3 install -U --user keras_applications==1.0.6 --no-deps
-    - pip3 install -U --user keras_preprocessing==1.0.5 --no-deps
+    - pip3 install -U --user pip numpy wheel packaging requests opt_einsum portpicker mock
+    - pip3 install -U --user keras_preprocessing --no-deps
     - yes '' | python3 ./configure.py
+    xcode_version: "14.3"
     build_flags:
-    - "--config=opt"
     # Suppress warning messages from all actions
     - "--output_filter=^$"
+    - "--remote_download_outputs=all"
+    - "--host_features=-force_no_whole_archive"
     build_targets:
     - "//tensorflow/tools/pip_package:build_pip_package"
   windows:
     environment:
       TF_IGNORE_MAX_BAZEL_VERSION: 1
-      USE_BAZEL_VERSION: latest
       BAZEL_VC: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC"
     batch_commands:
+    - pip3 install packaging
     - echo.| python ./configure.py
     build_flags:
-    - "--config=opt"
     # Suppress warning messages from all actions
     - "--output_filter=^$"
+    - "--host_features=-force_no_whole_archive"
     build_targets:
     - "//tensorflow/tools/pip_package:build_pip_package"

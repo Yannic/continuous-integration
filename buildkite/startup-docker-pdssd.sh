@@ -23,15 +23,6 @@ set -euxo pipefail
 ### Prevent dpkg / apt-get / debconf from trying to access stdin.
 export DEBIAN_FRONTEND="noninteractive"
 
-### Optimize the CPU scheduler for throughput.
-# From https://unix.stackexchange.com/questions/466722/how-to-change-the-length-of-time-slices-used-by-the-linux-cpu-scheduler/466723
-sysctl -w kernel.sched_min_granularity_ns=10000000
-sysctl -w kernel.sched_wakeup_granularity_ns=15000000
-sysctl -w vm.dirty_ratio=40
-# From https://www.postgresql.org/message-id/50E4AAB1.9040902@optionshouse.com
-sysctl -w kernel.sched_migration_cost_ns=5000000
-sysctl -w kernel.sched_autogroup_enabled=0
-
 ### Mount tmpfs to buildkite-agent's home.
 AGENT_HOME="/var/lib/buildkite-agent"
 mkdir -p "${AGENT_HOME}/.cache/bazel/_bazel_buildkite-agent"
@@ -42,20 +33,17 @@ chmod 0755 "${AGENT_HOME}"
 case $(hostname -f) in
   *.bazel-public.*)
     ARTIFACT_BUCKET="bazel-trusted-buildkite-artifacts"
-    BUILDKITE_TOKEN=$(gsutil cat "gs://bazel-trusted-encrypted-secrets/buildkite-trusted-agent-token.enc" | \
-        gcloud kms decrypt --project bazel-public --location global --keyring buildkite --key buildkite-trusted-agent-token --ciphertext-file - --plaintext-file -)
+    BUILDKITE_TOKEN=$(gcloud secrets versions access latest --secret="bazel-trusted-buildkite-agent-token" --project bazel-public)
     ;;
   *.bazel-untrusted.*)
     case $(hostname -f) in
       *-testing-*)
         ARTIFACT_BUCKET="bazel-testing-buildkite-artifacts"
-        BUILDKITE_TOKEN=$(gsutil cat "gs://bazel-testing-encrypted-secrets/buildkite-testing-agent-token.enc" | \
-            gcloud kms decrypt --project bazel-untrusted --location global --keyring buildkite --key buildkite-testing-agent-token --ciphertext-file - --plaintext-file -)
+        BUILDKITE_TOKEN=$(gcloud secrets versions access latest --secret="bazel-testing-buildkite-agent-token" --project bazel-untrusted)
         ;;
       *)
         ARTIFACT_BUCKET="bazel-untrusted-buildkite-artifacts"
-        BUILDKITE_TOKEN=$(gsutil cat "gs://bazel-untrusted-encrypted-secrets/buildkite-untrusted-agent-token.enc" | \
-            gcloud kms decrypt --project bazel-untrusted --location global --keyring buildkite --key buildkite-untrusted-agent-token --ciphertext-file - --plaintext-file -)
+        BUILDKITE_TOKEN=$(gcloud secrets versions access latest --secret="bazel-buildkite-agent-token" --project bazel-untrusted)
         ;;
     esac
 esac
@@ -67,17 +55,29 @@ systemctl start docker
 gcloud auth configure-docker --quiet
 sudo -H -u buildkite-agent gcloud auth configure-docker --quiet
 
+QUEUE="default"
+if [[ "$(uname -m)" == "aarch64" ]]; then
+  QUEUE="arm64"
+fi
+
+### Remove any Git hooks from the local Git mirror directory.
+if [[ -d /var/lib/gitmirrors ]]; then
+  find /var/lib/gitmirrors -type d -name hooks -exec rm -rf {} + || true
+fi
+
 ### Write the Buildkite agent configuration.
 cat > /etc/buildkite-agent/buildkite-agent.cfg <<EOF
 token="${BUILDKITE_TOKEN}"
 name="%hostname"
-tags="queue=default,kind=docker,os=linux"
-experiment="git-mirrors"
+tags="queue=${QUEUE},kind=docker,os=linux"
 build-path="/var/lib/buildkite-agent/builds"
 git-mirrors-path="/var/lib/gitmirrors"
 git-clone-mirror-flags="-v --bare"
+protect-dangerous-git-environment-variables=true
 hooks-path="/etc/buildkite-agent/hooks"
 plugins-path="/etc/buildkite-agent/plugins"
+no-local-hooks=true
+no-plugins=false
 disconnect-after-job=true
 health-check-addr=0.0.0.0:8080
 EOF
@@ -87,32 +87,48 @@ cat > /etc/buildkite-agent/hooks/environment <<EOF
 #!/bin/bash
 set -euo pipefail
 export BUILDKITE_ARTIFACT_UPLOAD_DESTINATION="gs://${ARTIFACT_BUCKET}/\${BUILDKITE_JOB_ID}"
+# google-bazel-presubmit, google-rules-cc-presubmit, and google-rules-java-presubmit
+# build unsubmitted Gerrit changes with branch=master/main, which never pass
+# Buildkite agent v4's strict commit verification. This has to be set from a
+# hook: under the default checkout-override-mode (from-job), the agent ignores
+# BUILDKITE_GIT_COMMIT_VERIFICATION from pipeline/step env.
+case "\${BUILDKITE_PIPELINE_SLUG:-}" in
+  google-bazel-presubmit|google-rules-cc-presubmit|google-rules-java-presubmit)
+    export BUILDKITE_GIT_COMMIT_VERIFICATION=off
+    ;;
+esac
 EOF
+
+### 1. Capture Job Start Time
+cat > /etc/buildkite-agent/hooks/pre-checkout <<'EOF'
+#!/bin/bash
+NOW=$(date +%s%3N)
+echo "JOB_START_TIME: ${NOW}"
+buildkite-agent env set "JOB_START_TIME=$NOW"
+EOF
+
+### 2. Calculate Checkout Duration
+cat > /etc/buildkite-agent/hooks/post-checkout <<'EOF'
+#!/bin/bash
+CHECKOUT_END_TIME=$(date +%s%3N)
+START_TIME=$(buildkite-agent env get JOB_START_TIME)
+if [[ -z "${START_TIME}" || ! "${START_TIME}" =~ ^[0-9]+$ ]]; then
+  echo "JOB_START_TIME is missing or non-numeric; skipping checkout duration metrics."
+  exit 0
+fi
+DIFF=$((CHECKOUT_END_TIME - START_TIME))
+CHECKOUT_DURATION_S=$(printf "%d.%03d" $((DIFF / 1000)) $((DIFF % 1000)))
+echo "CHECKOUT_END_TIME: ${CHECKOUT_END_TIME}"
+echo "CHECKOUT_DURATION_S: ${CHECKOUT_DURATION_S}"
+buildkite-agent env set "CHECKOUT_END_TIME=${CHECKOUT_END_TIME}"
+buildkite-agent env set "CHECKOUT_DURATION_S=${CHECKOUT_DURATION_S}"
+EOF
+
 
 ### Fix permissions of the Buildkite agent configuration files and hooks.
 chmod 0400 /etc/buildkite-agent/buildkite-agent.cfg
 chmod 0500 /etc/buildkite-agent/hooks/*
 chown -R buildkite-agent:buildkite-agent /etc/buildkite-agent
-
-### Pull a few popular Docker images in advance.
-case $(hostname -f) in
-    *-testing-*)
-        PREFIX="bazel-public/testing"
-        ;;
-    *)
-        PREFIX="bazel-public"
-        ;;
-esac
-
-docker pull "gcr.io/$PREFIX/centos7-java8" &
-docker pull "gcr.io/$PREFIX/centos7-releaser" &
-docker pull "gcr.io/$PREFIX/debian10-java11" &
-docker pull "gcr.io/$PREFIX/ubuntu1604-bazel-java8" &
-docker pull "gcr.io/$PREFIX/ubuntu1604-java8" &
-docker pull "gcr.io/$PREFIX/ubuntu1804-bazel-java11" &
-docker pull "gcr.io/$PREFIX/ubuntu1804-java11" &
-docker pull "gcr.io/$PREFIX/ubuntu2004-java11" &
-wait
 
 ### Start the Buildkite agent service.
 systemctl start buildkite-agent

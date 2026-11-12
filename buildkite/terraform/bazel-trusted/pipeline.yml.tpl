@@ -1,0 +1,43 @@
+---
+env:
+  GIT_HTTP_LOW_SPEED_LIMIT: "102400"
+  GIT_HTTP_LOW_SPEED_TIME: "180"
+%{ for key, value in envs ~}
+  ${key}: "${value}"
+%{ endfor ~}
+
+priority: ${try(priority, 0)}
+steps:
+  - command: |-%{ for command in steps.commands }
+      ${command}%{ endfor }%{ if try(steps.retry, false) }
+    retry:
+      automatic:
+        - exit_status: -1  # Agent was lost
+          limit: 2
+        - exit_status: 1
+          limit: 2%{ endif }
+    label: "${try(steps.label, ":pipeline:")}"
+    agents:
+      - "queue=default"%{ if try(length(steps.artifact_paths), 0) > 0 }
+    artifact_paths:%{ for artifact_path in steps.artifact_paths }
+      - "${artifact_path}"%{ endfor }%{ endif }
+    plugins:
+      - docker#v3.8.0:
+          always-pull: true
+          environment:
+            - "ANDROID_HOME"
+            - "ANDROID_NDK_HOME"
+            - "BUILDKITE_ARTIFACT_UPLOAD_DESTINATION"
+          image: "${try(steps.image, "gcr.io/bazel-public/ubuntu2404@sha256:4bc65868dcac6d63d5ecca1685c7a41e8549a5f38e041ff1f2edc8101cf213b8")}"
+          network: "host"
+          privileged: true
+          propagate-environment: true
+          propagate-uid-gid: true
+          volumes:
+            - "/etc/group:/etc/group:ro"
+            - "/etc/passwd:/etc/passwd:ro"
+            - "/etc/shadow:/etc/shadow:ro"
+            - "/opt/android-ndk-r15c:/opt/android-ndk-r15c:ro"
+            - "/opt/android-sdk-linux:/opt/android-sdk-linux:ro"
+            - "/var/lib/buildkite-agent:/var/lib/buildkite-agent"
+            - "/var/lib/gitmirrors:/var/lib/gitmirrors:ro"

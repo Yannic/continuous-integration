@@ -109,11 +109,17 @@ def run_buildifier(binary, flags, version=None, what=None):
         label += ": " + what
 
     eprint(label)
+    command = [binary] + flags
+    eprint("Executing: " + " ".join(command))
 
-    return subprocess.run(
-        [binary] + flags, capture_output=True, universal_newlines=True
+    result = subprocess.run(
+        command, capture_output=True, universal_newlines=True
     )
 
+    if result.stderr:
+        eprint(result.stderr)
+
+    return result
 
 def create_heading(issue_type, issue_count):
     return "##### :bazel: buildifier: found {} {} issue{} in your WORKSPACE, BUILD and *.bzl files\n".format(
@@ -133,7 +139,7 @@ def get_buildifier_info(version):
     if resolved_version not in all_releases:
         raise Exception("Unknown Buildifier version '{}'".format(version))
 
-    display_url, download_url = all_releases.get(resolved_version)
+    display_url, download_url = get_release_urls(all_releases[resolved_version])
     return resolved_version, display_url, download_url
 
 
@@ -143,7 +149,7 @@ def get_releases():
         content = body.decode(res.info().get_content_charset("iso-8859-1"))
 
     return {
-        r["tag_name"]: get_release_urls(r)
+        r["tag_name"].lstrip("v"): r
         for r in json.loads(content)
         if not r["prerelease"]
     }
@@ -151,7 +157,7 @@ def get_releases():
 
 def get_release_urls(release):
     for asset in release["assets"]:
-        if asset["name"] == "buildifier-linux-amd64":
+        if asset["name"] in ["buildifier", "buildifier-linux-amd64", "buildifier-linux_amd64"]:
             return release["html_url"], asset["browser_download_url"]
     raise Exception(
         "There is no Buildifier binary for release {}".format(release["tag_name"])

@@ -22,6 +22,9 @@ $env:TEMP = [Environment]::GetEnvironmentVariable("TEMP", "Machine")
 $env:TMP = [Environment]::GetEnvironmentVariable("TMP", "Machine")
 $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine")
 
+# Create a junction to the MSYS2 directory at a default path when installed with the installer.
+New-Item -ItemType Junction -Path "C:\msys64" -Target "C:\tools\msys64"
+
 ## Create an environment hook for the Buildkite agent.
 $myhostname = [System.Net.Dns]::GetHostName()
 if ($myhostname -like "*trusted*") {
@@ -41,6 +44,12 @@ SET JAVA_HOME=${env:JAVA_HOME}
 SET PATH=${env:PATH}
 SET TEMP=${env:TEMP}
 SET TMP=${env:TEMP}
+REM google-bazel-presubmit, google-rules-cc-presubmit, and google-rules-java-presubmit build unsubmitted
+REM Gerrit changes with branch=master/main, which never pass Buildkite agent v4's strict commit
+REM verification. Pipeline env cannot override it.
+IF "%BUILDKITE_PIPELINE_SLUG%"=="google-bazel-presubmit" SET BUILDKITE_GIT_COMMIT_VERIFICATION=off
+IF "%BUILDKITE_PIPELINE_SLUG%"=="google-rules-cc-presubmit" SET BUILDKITE_GIT_COMMIT_VERIFICATION=off
+IF "%BUILDKITE_PIPELINE_SLUG%"=="google-rules-java-presubmit" SET BUILDKITE_GIT_COMMIT_VERIFICATION=off
 "@
 [System.IO.File]::WriteAllLines("c:\buildkite\hooks\environment.bat", $buildkite_environment_hook)
 
@@ -49,6 +58,36 @@ $buildkite_preexit_hook = @"
 wmic pagefile list /format:list
 "@
 [System.IO.File]::WriteAllLines("c:\buildkite\hooks\pre-exit.bat", $buildkite_preexit_hook)
+
+Write-Host "Creating Buildkite agent duration hooks (pre-checkout, post-checkout, pre-command)..."
+$buildkite_precheckout_hook = @'
+$NOW = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+Write-Host "JOB_START_TIME: $NOW"
+buildkite-agent env set "JOB_START_TIME=$NOW"
+'@
+[System.IO.File]::WriteAllLines("c:\buildkite\hooks\pre-checkout.ps1", $buildkite_precheckout_hook)
+
+$buildkite_postcheckout_hook = @'
+$CHECKOUT_END_TIME = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+$START_TIME_STR = buildkite-agent env get JOB_START_TIME
+if ([string]::IsNullOrWhiteSpace($START_TIME_STR)) {
+  Write-Warning "JOB_START_TIME is missing; skipping checkout duration calculation."
+  return
+}
+$START_TIME = 0
+if (-not [long]::TryParse($START_TIME_STR.Trim(), [ref]$START_TIME)) {
+  Write-Warning "JOB_START_TIME '$START_TIME_STR' is not a valid Unix-ms timestamp; skipping checkout duration calculation."
+  return
+}
+$DIFF = $CHECKOUT_END_TIME - $START_TIME
+$CHECKOUT_DURATION_S = [math]::Round($DIFF / 1000.0, 3).ToString([cultureinfo]::InvariantCulture)
+Write-Host "CHECKOUT_END_TIME: $CHECKOUT_END_TIME"
+Write-Host "CHECKOUT_DURATION_S: $CHECKOUT_DURATION_S"
+buildkite-agent env set "CHECKOUT_END_TIME=$CHECKOUT_END_TIME"
+buildkite-agent env set "CHECKOUT_DURATION_S=$CHECKOUT_DURATION_S"
+'@
+[System.IO.File]::WriteAllLines("c:\buildkite\hooks\post-checkout.ps1", $buildkite_postcheckout_hook)
+
 
 ## Enable support for symlinks.
 Write-Host "Enabling SECreateSymbolicLinkPrivilege permission..."
@@ -88,35 +127,33 @@ Remove-Item -Path "$tmp"
 ## Write encrypted buildkite agent token into a file.
 $myhostname = [System.Net.Dns]::GetHostName()
 if ($myhostname -like "*trusted*") {
-  $buildkite_agent_token_url = "https://storage.googleapis.com/bazel-trusted-encrypted-secrets/buildkite-trusted-agent-token.enc"
   $project = "bazel-public"
-  $key = "buildkite-trusted-agent-token"
+  $secret = "bazel-trusted-buildkite-agent-token"
 } elseif ($myhostname -like "*testing*") {
-  $buildkite_agent_token_url = "https://storage.googleapis.com/bazel-testing-encrypted-secrets/buildkite-testing-agent-token.enc"
   $project = "bazel-untrusted"
-  $key = "buildkite-testing-agent-token"
+  $secret = "bazel-testing-buildkite-agent-token"
 } else {
-  $buildkite_agent_token_url = "https://storage.googleapis.com/bazel-untrusted-encrypted-secrets/buildkite-untrusted-agent-token.enc"
   $project = "bazel-untrusted"
-  $key = "buildkite-untrusted-agent-token"
-}
-$buildkite_agent_token_file = "c:\buildkite\buildkite_agent_token.enc"
-Write-Host "Getting Buildkite Agent token from GCS..."
-while ($true) {
-  try {
-    (New-Object Net.WebClient).DownloadFile($buildkite_agent_token_url, $buildkite_agent_token_file)
-    break
-  } catch {
-    $msg = $_.Exception.Message
-    Write-Host "Failed to download token: $msg"
-    Start-Sleep -Seconds 10
-  }
+  $secret = "bazel-buildkite-agent-token"
 }
 
-## Decrypt the Buildkite agent token.
-Write-Host "Decrypting Buildkite Agent token using KMS..."
-$buildkite_agent_token = & gcloud kms decrypt --project $project --location global --keyring buildkite --key $key --ciphertext-file $buildkite_agent_token_file --plaintext-file -
-Remove-Item $buildkite_agent_token_file
+# Fix ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1129)
+# Apply changes from https://github.com/bazelbuild/rules_foreign_cc/pull/1171
+cd $env:USERPROFILE;
+Invoke-WebRequest https://curl.haxx.se/ca/cacert.pem -OutFile $env:USERPROFILE\cacert.pem;
+$plaintext_pw = 'PASSWORD';
+$secure_pw = ConvertTo-SecureString $plaintext_pw -AsPlainText -Force;
+& openssl.exe pkcs12 -export -nokeys -out certs.pfx -in cacert.pem -passout pass:$plaintext_pw;
+Import-PfxCertificate -Password $secure_pw  -CertStoreLocation Cert:\LocalMachine\Root -FilePath certs.pfx;
+
+## Get the Buildkite agent token.
+Write-Host "Retrieving Buildkite Agent token from Secret Manager..."
+$buildkite_agent_token = & gcloud secrets versions access latest --secret=$secret --project $project
+
+## Remove any Git hooks from the local Git mirror directory.
+if (Test-Path "c:\buildkite\bazelbuild") {
+  Get-ChildItem -Path "c:\buildkite\bazelbuild" -Filter "hooks" -Directory -Recurse -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 ## Configure the Buildkite agent.
 Write-Host "Configuring Buildkite Agent..."
@@ -125,12 +162,14 @@ $buildkite_agent_config = @"
 token="${buildkite_agent_token}"
 name="%hostname"
 tags="queue=windows,kind=worker,os=windows"
-experiment="git-mirrors"
 build-path="c:\b"
 hooks-path="c:\buildkite\hooks"
 plugins-path="c:\buildkite\plugins"
+no-local-hooks=true
+no-plugins=false
 git-mirrors-path="c:\buildkite\bazelbuild"
 git-clone-mirror-flags="-v --bare"
+protect-dangerous-git-environment-variables=true
 disconnect-after-job=true
 health-check-addr=0.0.0.0:8080
 "@

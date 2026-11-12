@@ -1,28 +1,25 @@
 #!/bin/bash
 
 set -euxo pipefail
-
-case $(git symbolic-ref --short HEAD) in
-    master)
-        PREFIX="bazel-public"
-        ;;
-    testing)
-        PREFIX="bazel-public/testing"
-        ;;
-    *)
-        echo "You must build Docker images either from the master or the testing branch!"
-        exit 1
-esac
+PREFIX=bazel-public
 
 # Containers used by Bazel CI
-docker push "gcr.io/$PREFIX/centos7-java8" &
-docker push "gcr.io/$PREFIX/centos7-releaser" &
-docker push "gcr.io/$PREFIX/debian10-java11" &
-docker push "gcr.io/$PREFIX/ubuntu1604-bazel-java8" &
-docker push "gcr.io/$PREFIX/ubuntu1604-java8" &
-docker push "gcr.io/$PREFIX/ubuntu1804-bazel-java11" &
-docker push "gcr.io/$PREFIX/ubuntu1804-java11" &
-docker push "gcr.io/$PREFIX/ubuntu2004-bazel-java11" &
-docker push "gcr.io/$PREFIX/ubuntu2004-java11" &
-docker push "gcr.io/$PREFIX/ubuntu2004-java11-kythe" &
+docker push "gcr.io/$PREFIX/rockylinux8" &
+docker push "gcr.io/$PREFIX/rockylinux8-java8" &
+docker push "gcr.io/$PREFIX/rockylinux8-java11" &
+docker push "gcr.io/$PREFIX/rockylinux8-java11-devtoolset10" &
+docker push "gcr.io/$PREFIX/rockylinux8-releaser" &
+docker push "gcr.io/$PREFIX/debian12" &
+docker push "gcr.io/$PREFIX/debian13" &
+docker push "gcr.io/$PREFIX/ubuntu2204-java17" &
+docker push "gcr.io/$PREFIX/ubuntu2204-kythe" &
+docker push "gcr.io/$PREFIX/ubuntu2204-bazel-java17" &
+docker push "gcr.io/$PREFIX/ubuntu2204" &
+docker push "gcr.io/$PREFIX/ubuntu2404" &
+docker push "gcr.io/$PREFIX/ubuntu2404-kythe" &
+docker push "gcr.io/$PREFIX/fedora43-java25" &
+docker push "gcr.io/$PREFIX/fedora45-java25" &
+docker push "gcr.io/$PREFIX/fedora43-bazel-java25" &
+docker push "gcr.io/$PREFIX/fedora45-bazel-java25" &
+docker push "gcr.io/$PREFIX/docgen" &
 wait

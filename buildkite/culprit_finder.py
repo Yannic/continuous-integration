@@ -26,15 +26,13 @@ BAZEL_REPO_DIR = os.getcwd()
 
 BUILDKITE_ORG = os.environ["BUILDKITE_ORGANIZATION_SLUG"]
 
-SCRIPT_URL = {
-    "bazel-testing": "https://raw.githubusercontent.com/bazelbuild/continuous-integration/testing/buildkite/culprit_finder.py",
-    "bazel-trusted": "https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/buildkite/culprit_finder.py",
-    "bazel": "https://raw.githubusercontent.com/bazelbuild/continuous-integration/master/buildkite/culprit_finder.py",
-}[BUILDKITE_ORG] + "?{}".format(int(time.time()))
+SCRIPT_URL = "https://raw.githubusercontent.com/bazelbuild/continuous-integration/{}/buildkite/culprit_finder.py?{}".format(
+    bazelci.GITHUB_REF, int(time.time())
+)
 
 
 def fetch_culprit_finder_py_command():
-    return "curl -s {0} -o culprit_finder.py".format(SCRIPT_URL)
+    return bazelci.curl_download_command(SCRIPT_URL, "culprit_finder.py")
 
 
 def get_bazel_commits_between(first_commit, second_commit):
@@ -50,15 +48,16 @@ def get_bazel_commits_between(first_commit, second_commit):
         )
         return [i for i in reversed(output.decode("utf-8").split("\n")) if i]
     except subprocess.CalledProcessError as e:
-        raise bazelci.BazelBuildFailedException(
+        raise bazelci.BuildkiteException(
             "Failed to get bazel commits between %s..%s:\n%s"
             % (first_commit, second_commit, str(e))
         )
 
 
 def get_configs(project_name):
-    http_config = bazelci.DOWNSTREAM_PROJECTS[project_name]["http_config"]
-    configs = bazelci.fetch_configs(http_config, None)
+    http_config = bazelci.DOWNSTREAM_PROJECTS[project_name].get("http_config")
+    file_config = bazelci.DOWNSTREAM_PROJECTS[project_name].get("file_config")
+    configs = bazelci.fetch_configs(http_config, file_config)
     return configs
 
 
@@ -76,7 +75,8 @@ def get_tasks(project_name):
 def test_with_bazel_at_commit(
     project_name, task_name, repo_location, bazel_commit, needs_clean, repeat_times
 ):
-    http_config = bazelci.DOWNSTREAM_PROJECTS[project_name]["http_config"]
+    http_config = bazelci.DOWNSTREAM_PROJECTS[project_name].get("http_config")
+    file_config = bazelci.DOWNSTREAM_PROJECTS[project_name].get("file_config")
     for i in range(1, repeat_times + 1):
         if repeat_times > 1:
             bazelci.print_collapsed_group(":bazel: Try %s time" % i)
@@ -85,10 +85,11 @@ def test_with_bazel_at_commit(
                 [
                     "runner",
                     "--task=" + task_name,
-                    "--http_config=" + http_config,
                     "--repo_location=" + repo_location,
-                    "--use_bazel_at_commit=" + bazel_commit,
+                    "--overwrite_bazel_version=" + bazel_commit,
                 ]
+                + (["--http_config=" + http_config] if http_config else [])
+                + (["--file_config=" + file_config,] if file_config else [])
                 + (["--needs_clean"] if needs_clean else [])
             )
         except subprocess.CalledProcessError as e:
@@ -99,14 +100,51 @@ def test_with_bazel_at_commit(
     return True
 
 
-def clone_git_repository(project_name, task_name):
-    platform_name = get_platform(project_name, task_name)
+def clone_git_repository(project_name, git_commit=None, suppress_stdout=False):
     git_repository = bazelci.DOWNSTREAM_PROJECTS[project_name]["git_repository"]
-    last_green_commit_url = bazelci.bazelci_last_green_commit_url(
-        git_repository, bazelci.DOWNSTREAM_PROJECTS[project_name]["pipeline_slug"]
-    )
-    git_commit = bazelci.get_last_green_commit(last_green_commit_url)
-    return bazelci.clone_git_repository(git_repository, platform_name, git_commit)
+    if not git_commit:
+        git_commit = bazelci.get_last_green_commit(project_name)
+    return bazelci.clone_git_repository(git_repository, git_commit, suppress_stdout=suppress_stdout)
+
+
+def get_previous_bazel_commit(current_commit, count):
+    """Get a previous bazel commit that is a given number of commits older than the current one."""
+    try:
+        os.chdir(BAZEL_REPO_DIR)
+        output = subprocess.check_output(
+            ["git", "rev-parse", "%s~%s" % (current_commit, count)]
+        )
+        return output.decode("utf-8").strip()
+    except subprocess.CalledProcessError as e:
+        raise bazelci.BuildkiteException(
+            "Failed to get bazel commit that is %s commits older than %s" % (count, current_commit)
+        )
+
+
+def identify_bisect_range(args, repo_location):
+    MAX_RETRY = 5
+    retry = 0
+    step = 100
+    good_bazel_commit = args.good_bazel_commit
+    bad_bazel_commit = args.bad_bazel_commit
+    while retry <= MAX_RETRY:
+        bazelci.print_collapsed_group("Check bazel commit at " + good_bazel_commit)
+        if test_with_bazel_at_commit(
+            project_name=args.project_name,
+            task_name=args.task_name,
+            repo_location=repo_location,
+            bazel_commit=good_bazel_commit,
+            needs_clean=args.needs_clean,
+            repeat_times=args.repeat_times,
+        ):
+            return good_bazel_commit, bad_bazel_commit
+        bazelci.print_collapsed_group("Given good bazel commit is not good, try to find a previous good commit (%s~%s)." % (good_bazel_commit, step))
+        bad_bazel_commit = good_bazel_commit
+        good_bazel_commit = get_previous_bazel_commit(good_bazel_commit, step)
+        retry += 1
+        step = step * 2
+
+    raise Exception("Cannot find a good bazel commit, abort bisecting.")
 
 
 def start_bisecting(
@@ -141,7 +179,7 @@ def start_bisecting(
 
 
 def print_culprit_finder_pipeline(
-    project_name, tasks, good_bazel_commit, bad_bazel_commit, needs_clean, repeat_times
+    project_name, tasks, good_bazel_commit, bad_bazel_commit, needs_clean, repeat_times, project_commit=None
 ):
     pipeline_steps = []
     for task_name in tasks:
@@ -150,7 +188,7 @@ def print_culprit_finder_pipeline(
             project_name
         )
         command = (
-            '%s culprit_finder.py runner --project_name="%s" --task_name=%s --good_bazel_commit=%s --bad_bazel_commit=%s %s %s'
+            '%s culprit_finder.py runner --project_name="%s" --task_name=%s --good_bazel_commit=%s --bad_bazel_commit=%s %s %s %s'
             % (
                 bazelci.PLATFORMS[platform_name]["python"],
                 project_name,
@@ -159,9 +197,10 @@ def print_culprit_finder_pipeline(
                 bad_bazel_commit,
                 "--needs_clean" if needs_clean else "",
                 ("--repeat_times=" + str(repeat_times)) if repeat_times else "",
+                ("--project_commit=" + project_commit) if project_commit else "",
             )
         )
-        commands = [bazelci.fetch_bazelcipy_command(), fetch_culprit_finder_py_command(), command]
+        commands = [bazelci.fetch_ci_scripts_command(), fetch_culprit_finder_py_command(), command]
         pipeline_steps.append(bazelci.create_step(label, commands, platform_name))
     print(yaml.dump({"steps": pipeline_steps}))
 
@@ -183,11 +222,23 @@ def main(argv=None):
     runner.add_argument("--bad_bazel_commit", type=str)
     runner.add_argument("--needs_clean", type=bool, nargs="?", const=True)
     runner.add_argument("--repeat_times", type=int, default=1)
+    runner.add_argument("--project_commit", type=str)
 
     args = parser.parse_args(argv)
     if args.subparsers_name == "culprit_finder":
         try:
             project_name = os.environ["PROJECT_NAME"]
+
+            project_commit = os.environ.get("PROJECT_COMMIT")
+
+            if project_name not in bazelci.DOWNSTREAM_PROJECTS:
+                raise Exception(
+                    "Project name '%s' not recognized, available projects are %s"
+                    % (project_name, str((bazelci.DOWNSTREAM_PROJECTS.keys())))
+                )
+
+            # Clone the project repo so that we can get its CI config file at the same last green commit.
+            project_dir = clone_git_repository(project_name, git_commit=project_commit, suppress_stdout=True)
 
             # For old config file, we can still set PLATFORM_NAME as task name.
             task = os.environ.get("PLATFORM_NAME") or os.environ.get("TASK_NAME")
@@ -198,35 +249,30 @@ def main(argv=None):
             else:
                 tasks = get_tasks(project_name)
 
-            good_bazel_commit = os.environ.get("GOOD_BAZEL_COMMIT")
-            if not good_bazel_commit:
-                # If GOOD_BAZEL_COMMIT is not set, use recorded last bazel green commit for downstream project
-                last_green_commit_url = bazelci.bazelci_last_green_downstream_commit_url()
-                good_bazel_commit = bazelci.get_last_green_commit(last_green_commit_url)
-
             bad_bazel_commit = os.environ.get("BAD_BAZEL_COMMIT")
             if not bad_bazel_commit:
                 # If BAD_BAZEL_COMMIT is not set, use HEAD commit.
                 bad_bazel_commit = (
-                    subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+                    subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=BAZEL_REPO_DIR).decode("utf-8").strip()
                 )
+
+            good_bazel_commit = os.environ.get("GOOD_BAZEL_COMMIT")
+            if not good_bazel_commit:
+                # If GOOD_BAZEL_COMMIT is not set, use 100 commits older than BAD_BAZEL_COMMIT
+                good_bazel_commit = get_previous_bazel_commit(bad_bazel_commit, 100)
         except KeyError as e:
             raise Exception("Environment variable %s must be set" % str(e))
 
         needs_clean = False
-        if "NEEDS_CLEAN" in os.environ:
+        if os.environ.get("NEEDS_CLEAN", None) == "1":
             needs_clean = True
 
         repeat_times = 1
         if "REPEAT_TIMES" in os.environ:
             repeat_times = int(os.environ["REPEAT_TIMES"])
 
-        if project_name not in bazelci.DOWNSTREAM_PROJECTS:
-            raise Exception(
-                "Project name '%s' not recognized, available projects are %s"
-                % (project_name, str((bazelci.DOWNSTREAM_PROJECTS.keys())))
-            )
-
+        # Change into the project directory so that we can read local config file like `.bazelci/presubmit.yml`
+        os.chdir(project_dir)
         print_culprit_finder_pipeline(
             project_name=project_name,
             tasks=tasks,
@@ -234,27 +280,16 @@ def main(argv=None):
             bad_bazel_commit=bad_bazel_commit,
             needs_clean=needs_clean,
             repeat_times=repeat_times,
+            project_commit=project_commit,
         )
     elif args.subparsers_name == "runner":
-        repo_location = clone_git_repository(args.project_name, args.task_name)
-        bazelci.print_collapsed_group("Check good bazel commit " + args.good_bazel_commit)
-        if not test_with_bazel_at_commit(
-            project_name=args.project_name,
-            task_name=args.task_name,
-            repo_location=repo_location,
-            bazel_commit=args.good_bazel_commit,
-            needs_clean=args.needs_clean,
-            repeat_times=args.repeat_times,
-        ):
-            raise Exception(
-                "Given good commit (%s) is not actually good, abort bisecting."
-                % args.good_bazel_commit
-            )
+        repo_location = clone_git_repository(args.project_name, git_commit=args.project_commit)
+        good_bazel_commit, bad_bazel_commit = identify_bisect_range(args, repo_location)
         start_bisecting(
             project_name=args.project_name,
             task_name=args.task_name,
             repo_location=repo_location,
-            commits_list=get_bazel_commits_between(args.good_bazel_commit, args.bad_bazel_commit),
+            commits_list=get_bazel_commits_between(good_bazel_commit, bad_bazel_commit),
             needs_clean=args.needs_clean,
             repeat_times=args.repeat_times,
         )

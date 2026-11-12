@@ -1,0 +1,72 @@
+--- postsubmit.yml	2026-01-14 10:22:04.444867882 +0000
++++ bazel-postsubmit.yml	2026-01-14 10:21:46.445794736 +0000
+@@ -1,10 +1,12 @@
+ ---
++# Update this file by running ./update-bazel-postsubmit.sh under the same directory
+ 
+ tasks:
+   rockylinux8:
+     shell_commands:
+       - rm -rf $HOME/bazeltest
+       - mkdir $HOME/bazeltest
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=ci-linux"
+     build_targets:
+@@ -47,6 +49,7 @@
+     shell_commands:
+       - rm -rf $HOME/bazeltest
+       - mkdir $HOME/bazeltest
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=ci-linux"
+     build_targets:
+@@ -60,6 +63,7 @@
+     shell_commands:
+       - rm -rf $HOME/bazeltest
+       - mkdir $HOME/bazeltest
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=ci-linux"
+     build_targets:
+@@ -101,6 +105,7 @@
+     shell_commands:
+       - rm -rf $HOME/bazeltest
+       - mkdir $HOME/bazeltest
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=ci-linux"
+     build_targets:
+@@ -155,6 +160,7 @@
+       - rm -rf $HOME/bazeltest
+       - mkdir $HOME/bazeltest
+       - ln -sf $OUTPUT_BASE/external $HOME/bazeltest/external
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=ci-macos"
+     build_targets:
+@@ -179,6 +185,7 @@
+     setup:
+       - mkdir C:\b
+       - mklink /J C:\b\bazeltest_external %OUTPUT_BASE:/=\%\external
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=ci-windows"
+     build_targets:
+@@ -222,6 +229,7 @@
+     setup:
+       - mkdir C:\b
+       - mklink /J C:\b\bazeltest_external %OUTPUT_BASE:/=\%\external
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=ci-windows"
+       - "--config=windows_arm64"
+@@ -233,6 +241,8 @@
+   rbe_ubuntu2004:
+     platform: ubuntu2004
+     name: "RBE"
++    shell_commands:
++      - bazel mod deps --lockfile_mode=update
+     build_flags:
+       - "--config=remote"
+       - "--remote_executor=grpcs://remotebuildexecution.googleapis.com"
